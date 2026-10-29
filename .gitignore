@@ -8,3 +8,12 @@ crash.*.log
 
 # Instalador local da AWS CLI
 awscliv2.zip
+
+# Arquivos locais da AWS CLI
+infraestructure/terraform/environments/dev/aws/
+infraestructure/terraform/environments/dev/awscliv2.zip
+
+# Terraform local
+**/.terraform/
+*.tfstate
+*.tfstate.*
