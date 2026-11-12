@@ -99,7 +99,11 @@ def diagnostico() -> list[dict]:
     for tabela, mapa in C.COLUNAS.items():
         try:
             df = ler_bruto(tabela)
-            faltando = [f"{l} → {r}" for l, r in mapa.items() if r not in df.columns]
+            faltando = [
+                    f"{coluna_origem} → {coluna_destino}"
+                    for coluna_origem, coluna_destino in mapa.items()
+                    if coluna_destino not in df.columns
+            ]
             linhas.append({"tabela": tabela, "status": "OK", "linhas": len(df),
                            "colunas na tabela": ", ".join(map(str, df.columns)),
                            "mapeadas e não encontradas": ", ".join(faltando) or "—"})

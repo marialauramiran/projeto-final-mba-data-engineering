@@ -205,7 +205,11 @@ def resumo(cards: dict) -> str:
     partes = []
     if cards["frete"].cor in ("amarelo", "vermelho"):
         partes.append("frete alto para o ticket")
-    criticas = [l[0] for l in cards["atraso"].linhas if len(l) == 3 and l[2] == "vermelho"]
+    criticas = [
+        linha[0]
+        for linha in cards["atraso"].linhas
+        if len(linha) == 3 and linha[2] == "vermelho"
+    ]
     if criticas:
         partes.append(f"risco de atraso para {', '.join(criticas)}")
     elif cards["atraso"].cor == "amarelo":
@@ -222,12 +226,19 @@ def resumo(cards: dict) -> str:
 
 def recomendacoes(cards: dict) -> list[str]:
     recs = []
-    lin = [l for l in cards["atraso"].linhas if len(l) == 3]
-    criticas = [l[0] for l in lin if l[2] == "vermelho"]
+    linhas = [
+        linha for linha in cards["atraso"].linhas
+        if len(linha) == 3
+    ]
+    criticas = [
+        linha[0] for linha in linhas
+        if linha[2] == "vermelho"
+    ]
     if criticas:
-        boas = [l[0] for l in lin if l[2] == "verde"]
-        recs.append(f"Anuncie prazo maior para {', '.join(criticas)}"
-                    + (f" ou priorize {' e '.join(boas)} na divulgação" if boas else ""))
+        boas = [
+            linha[0] for linha in linhas
+            if linha[2] == "verde"
+        ]
     if cards["frete"].cor in ("amarelo", "vermelho"):
         recs.append("Venda em kit para diluir o frete no ticket")
     if cards["reputacao"].cor in ("amarelo", "vermelho"):
