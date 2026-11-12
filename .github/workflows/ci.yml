@@ -1,0 +1,32 @@
+name: CI - Validacao do Projeto
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  validate:
+    name: Validar aplicacao Python
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Baixar codigo do repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar Ruff
+        run: pip install ruff
+
+      - name: Verificar sintaxe Python
+        run: python -m compileall -q raio_x_app
+
+      - name: Verificar qualidade do codigo
+        run: ruff check raio_x_app --select E4,E7,E9
