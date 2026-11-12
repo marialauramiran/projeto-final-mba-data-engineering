@@ -265,7 +265,7 @@ display(df_mart.filter("atrasou = 1").select(
 
 # MAGIC %md
 # MAGIC ## 4. O atraso é estável ao longo do tempo?
-# MAGIC **Como ler:** meses com picos (ex.: Black Friday/nov-2017, fev–mar/2018) indicam choques de capacidade logística. Isso **impacta a validação temporal do modelo**: treinar e testar em períodos com regimes diferentes muda a métrica.
+# MAGIC **Como ler:** meses com picos (ex.: Black Friday/nov-2017, fev–mar/2018) indicam choques de capacidade logística. Isso **impacta a validação temporal do modelo**
 
 # COMMAND ----------
 

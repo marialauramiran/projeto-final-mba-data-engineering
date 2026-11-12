@@ -1,1 +1,4 @@
 command: ["streamlit", "run", "streamlit_app.py"]
+env:
+  - name: RAIOX_PATH
+    value: "/Volumes/workspace/olist_gold/parquet"

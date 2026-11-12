@@ -1,5 +1,4 @@
-streamlit>=1.40
-pandas>=2.2
-numpy>=2.0
-pyarrow>=16
-
+streamlit
+pandas
+pyarrow
+databricks-sdk
