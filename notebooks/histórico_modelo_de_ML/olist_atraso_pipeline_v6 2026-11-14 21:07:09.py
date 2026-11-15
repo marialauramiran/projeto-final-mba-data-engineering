@@ -4,6 +4,26 @@
 # environment_version = "6"
 # ///
 # MAGIC %md
+# MAGIC # Atraso de entrega Olist: v6 (v5 + aprendizados da análise de 14/11)
+# MAGIC
+# MAGIC **Auditoria da duplicação (seção 1b):** a v5 já evita a duplicação de pedidos. Itens e pagamentos são agregados por pedido antes dos joins, a avaliação é reduzida a uma por pedido e a geolocalização a um ponto por CEP. Os testes de integridade (chaves únicas, 1 linha por pedido e GMV reconciliado) passam. A célula 1b mostra os números de cada etapa e o efeito nos resultados.
+# MAGIC
+# MAGIC **O que muda da v5 para a v6 (todas as escolhas feitas na VALIDAÇÃO, nunca no teste):**
+# MAGIC
+# MAGIC | # | Mudança | Por quê |
+# MAGIC |---|---|---|
+# MAGIC | 1 | Novas variáveis **"atrasos em aberto"** (plataforma e UF de destino) | As taxas "recentes" só percebem um choque quando os pedidos atrasados são entregues (1–2 meses depois). Pedidos vencidos e ainda não entregues são conhecidos na hora |
+# MAGIC | 2 | `mes` sai das candidatas | Só há um ano de dados: o modelo decoraria o mês, não a sazonalidade |
+# MAGIC | 3 | Seleção de variáveis **por critério** (relevância mínima + redundância), sem número fixo de 30 | O número de variáveis passa a ser consequência da análise |
+# MAGIC | 4 | **Recorte do treino recomparado na validação** (`ESTRATEGIA_RECORTE = "auto"`) | "Equilibrado sem atípicos" descarta ~40% do treino; no experimento de 14/11, tirar os meses atípicos piorou o recall nos 3 folds |
+# MAGIC | 5 | **Sem balanceamento** na busca | Pesos e subamostragem não melhoraram a ordenação e pioraram a calibração |
+# MAGIC | 6 | Faixa de alerta pelo **menor custo** (`CRITERIO_FAIXA = "custo"`, razão 10×), faixas até 70% | Perder um atraso custa 5 a 10 vezes mais que um alarme falso (análise das avaliações) |
+# MAGIC | 7 | Busca e checkpoints com nomes novos (`v6`) | Força o retreino com as variáveis novas, sem reaproveitar arquivos da v5 |
+# MAGIC
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## 0. Configuração
 
 # COMMAND ----------
@@ -48,10 +68,20 @@ INICIO_TESTE = "2018-04-01"       # teste igual ao da versão original (abr-ago/
 MESES_CALIBRACAO = 1              # meses logo antes do teste reservados para calibrar e escolher o limiar
 EMBARGO_DIAS = 30                 # pedidos comprados nos 30 dias antes de um corte não entram no treino
 FIM_TREINO_FINAL = str((pd.Timestamp(INICIO_TESTE) - pd.DateOffset(months=MESES_CALIBRACAO)).date())
-CALIBRAR = True                   # calibrador sigmoide ajustado na calibração (o Brier sem calibração é reportado)
+CALIBRAR = True                   # mantido por compatibilidade; a v5 usa CALIBRACAO abaixo
+
+# ---- v5: consolidação
+VERSAO_FINAL = "v6_aprendizados"  # nome dos checkpoints do treino final (v6: busca refeita)
+CALIBRACAO = "prevalencia"        # "prevalencia" = corrige a inflação do balanceamento usando só o treino
+                                  # "sigmoide"    = calibrador no mês de calibração (como na v2)
+FAIXAS_ALERTA = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.70]   # % de pedidos sinalizados testados
+CRITERIO_FAIXA = "custo"          # v6: "custo" (menor custo total) | "equilibrio" | "f1" | "youden" | "recall_minimo"
+RAZAO_CUSTO = 10                  # v6: perder um atraso custa 10x um alarme falso (análise das avaliações: 5 a 10x)
+RECALL_MINIMO = 0.50              # usado só pelo critério "recall_minimo"
 
 # ---- RECORTE DO TREINO (seção 7b compara as estratégias na validação)
-ESTRATEGIA_RECORTE = "auto"       # "auto" = a de maior PR-AUC na validação; ou fixe um nome, ex.: "sem_atipicos"
+ESTRATEGIA_RECORTE = "auto"       # v6: "auto" recompara na validação; ou fixe: "expansiva", "equilibrado_sem_atipicos"...
+ESTRATEGIAS_COMPARAR = ["expansiva", "sem_atipicos", "equilibrado_sem_atipicos", "recentes"]
 ESTRATEGIA_SELECAO = "expansiva"  # recorte usado só na seleção de variáveis (igual à versão original)
 MESES_TREINO = 5                  # usado pela estratégia "recentes"
 FATOR_ATIPICO = 1.5               # mês atípico = taxa de atraso acima de 1,5x a mediana mensal do próprio treino
@@ -86,7 +116,9 @@ PESOS_DECISAO = {
 assert abs(sum(PESOS_DECISAO.values()) - 1) < 1e-9
 
 # seleção de variáveis (matriz de correlação)
-N_FEATURES = 30                   # variáveis que entram no modelo
+N_FEATURES_MAX = 40               # v6: teto de segurança; a seleção para antes pelo critério abaixo
+MIN_RELEVANCIA = 0.01             # v6: variável com relevância abaixo disso não entra
+N_FEATURES = N_FEATURES_MAX       # recalculado na seleção (seção 7)
 LIMIAR_REDUNDANCIA = 0.85         # duas variáveis com correlação acima disso não entram juntas
 
 # COMMAND ----------
@@ -332,6 +364,57 @@ gmv_itens = silver["items"].join(integrada.select("order_id"), "order_id", "semi
 gmv_base = integrada.agg(F.sum("valor_produtos")).first()[0]
 assert abs(gmv_itens - gmv_base) < 1, "GMV da base integrada não bate com order_items"
 print(f"Base integrada: {n_ped:,} pedidos x {len(integrada.columns)} colunas | GMV R$ {gmv_base:,.2f} (reconciliado)")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 1b. Auditoria da duplicação e da limpeza (v6)
+
+# COMMAND ----------
+
+# Mostra, etapa por etapa, onde a base poderia duplicar e como cada ponto foi tratado.
+rev_bruto = ler_silver(TABELAS["reviews"])
+n_rev, n_rev_ped = rev_bruto.count(), rev_bruto.select("order_id").distinct().count()
+ped_multi_rev = rev_bruto.groupBy("order_id").count().filter("count > 1").count()
+n_itens, n_ped_itens = silver["items"].count(), silver["items"].select("order_id").distinct().count()
+n_pag, n_ped_pag = silver["payments"].count(), silver["payments"].select("order_id").distinct().count()
+n_orders = silver["orders"].count()
+n_geo = silver_geo.count() if silver_geo is not None else 0
+n_cep = geo.count() if geo is not None else 0
+itens_sem_produto = silver["items"].join(silver["products"].select("product_id"), "product_id", "left_anti")
+n_itens_sem_prod = itens_sem_produto.count()
+n_ped_sem_prod = itens_sem_produto.select("order_id").distinct().count()
+
+auditoria = pd.DataFrame([
+    {"etapa": "Avaliações", "linhas_na_silver": n_rev, "chaves_unicas": n_rev_ped,
+     "risco": f"{ped_multi_rev:,} pedidos com mais de 1 avaliação: o join multiplicaria esses pedidos",
+     "tratamento": "Mantida só a avaliação mais recente por pedido (row_number)",
+     "efeito_no_modelo": "Nenhum: avaliação é pós-entrega e só entra na análise de satisfação"},
+    {"etapa": "Itens", "linhas_na_silver": n_itens, "chaves_unicas": n_ped_itens,
+     "risco": f"{n_itens - n_ped_itens:,} linhas a mais que pedidos (1 linha por unidade)",
+     "tratamento": "Agregados por pedido (somas, máximos, contagens) antes do join",
+     "efeito_no_modelo": "Nenhum: GMV da base reconciliado com a soma dos itens"},
+    {"etapa": "Pagamentos", "linhas_na_silver": n_pag, "chaves_unicas": n_ped_pag,
+     "risco": f"{n_pag - n_ped_pag:,} linhas a mais que pedidos (vários pagamentos)",
+     "tratamento": "Agregados por pedido; tipo = pagamento de maior valor",
+     "efeito_no_modelo": "Nenhum"},
+    {"etapa": "Geolocalização", "linhas_na_silver": n_geo, "chaves_unicas": n_cep,
+     "risco": "Várias coordenadas por CEP",
+     "tratamento": "Média das coordenadas por CEP (só pontos dentro do Brasil)",
+     "efeito_no_modelo": "Nenhum"},
+    {"etapa": "Pedidos sem item", "linhas_na_silver": n_orders, "chaves_unicas": n_ped,
+     "risco": f"{n_orders - n_ped:,} pedidos sem nenhum item",
+     "tratamento": "Excluídos (join inner com os itens): não têm produto, frete nem vendedor",
+     "efeito_no_modelo": "Nenhum: quase todos cancelados ou indisponíveis"},
+    {"etapa": "Produtos removidos na Silver", "linhas_na_silver": n_itens_sem_prod, "chaves_unicas": n_ped_sem_prod,
+     "risco": "Itens cujo produto não existe na Silver (produtos sem categoria removidos na limpeza da camada)",
+     "tratamento": "Categoria 'desconhecido'; peso/volume nulos imputados pela mediana com indicador",
+     "efeito_no_modelo": f"Pequeno: {n_ped_sem_prod / n_ped:.1%} dos pedidos perdem peso e categoria"},
+])
+display(auditoria)
+print(f"Base integrada: {n_ped:,} pedidos = {n_unicos:,} order_id distintos -> sem duplicação")
+print("Conclusão: a limpeza não altera os resultados do modelo; a única perda real de informação vem da Silver "
+      "(produtos sem categoria), e é pequena.")
 
 # COMMAND ----------
 
@@ -678,6 +761,28 @@ def contagem_anterior(ped, chave, janela_dias):
     return out
 
 
+def contar_antes(ped, chave, col_t, janela_dias=None):
+    """Nº de eventos (col_t) da mesma chave ocorridos ESTRITAMENTE antes de cada compra.
+    Com janela_dias, só os ocorridos nos últimos N dias antes da compra."""
+    ev = ped.loc[ped[col_t].notna(), [chave, col_t]].rename(columns={col_t: "_t"}).sort_values("_t", kind="mergesort")
+    ev["_t"] = ev["_t"].astype("datetime64[ns]")
+    ev["_n"] = ev.groupby(chave, sort=False).cumcount() + 1
+
+    def ate(deslocamento, incluir_igual):
+        q = ped[[chave, "order_purchase_timestamp"]].copy()
+        q["_t"] = (q["order_purchase_timestamp"] - deslocamento).astype("datetime64[ns]")
+        q["_idx"] = np.arange(len(q))
+        q = q.sort_values("_t", kind="mergesort")
+        h = pd.merge_asof(q, ev[[chave, "_t", "_n"]], on="_t", by=chave, direction="backward",
+                          allow_exact_matches=incluir_igual)
+        return h.sort_values("_idx")["_n"].fillna(0).to_numpy()
+
+    n = ate(pd.Timedelta(0), False)
+    if janela_dias is not None:
+        n = n - ate(pd.Timedelta(days=janela_dias), True)
+    return n
+
+
 def criar_features(ped):
     ped = ped.sort_values("order_purchase_timestamp", kind="mergesort").copy()
     ts = ped["order_purchase_timestamp"]
@@ -718,6 +823,27 @@ def criar_features(ped):
     ped["taxa_atraso_destino_hist"] = destino["taxa_atraso"].fillna(ger["taxa_atraso"])
     ped["pedidos_plataforma_7d"] = contagem_anterior(ped, "_geral", 7)
 
+    # ---------------------------------------------------------- v6: atrasos em aberto (tempo real, sem vazamento)
+    # No instante da compra: pedidos com data prometida JÁ VENCIDA e ainda NÃO entregues. Um pedido deixa de
+    # contar como "em aberto" quando é entregue ou, no máximo, 90 dias após o prometido (regra fixa, para que
+    # pedidos extraviados não se acumulem para sempre).
+    valido = ~ped["order_status"].isin(["canceled", "unavailable"]) & ped["order_estimated_delivery_date"].notna()
+    prometido = ped["order_estimated_delivery_date"]
+    limite = prometido + pd.Timedelta(days=90)
+    entrega = ped["order_delivered_customer_date"]
+    resolvido = entrega.where(entrega > prometido, prometido).where(entrega.notna())   # NaT se não entregue
+    ped["_vencido_em"] = prometido.where(valido)
+    ped["_resolvido_em"] = resolvido.where(resolvido < limite, limite).where(valido)
+    for chave, nome in [("_geral", "plataforma"), ("customer_state", "destino")]:
+        abertos = contar_antes(ped, chave, "_vencido_em") - contar_antes(ped, chave, "_resolvido_em")
+        vencidos_janela = contar_antes(ped, chave, "_vencido_em", JANELA_RECENTE_DIAS)
+        if nome == "plataforma":
+            taxa_plat = np.where(vencidos_janela > 0, abertos / np.maximum(vencidos_janela, 1), 0.0)
+            ped["atrasos_abertos_plataforma"] = taxa_plat
+        else:
+            ped["atrasos_abertos_destino"] = ((abertos + MIN_EVENTOS_RECENTE * taxa_plat)
+                                              / (vencidos_janela + MIN_EVENTOS_RECENTE))
+
     # Folgas: prazo prometido menos o tempo que a rota/vendedor costumava levar
     ped["folga_prometida"] = ped["prazo_prometido_dias"] - ped["entrega_rota_hist_dias"]
 
@@ -741,7 +867,7 @@ def criar_features(ped):
     ped["fim_de_semana"] = (ped["dia_semana"] >= 5).astype(int)
     ped["cliente_recorrente"] = (ped.groupby("_cliente")["order_purchase_timestamp"].rank(method="min") > 1).astype(int)
 
-    return ped.drop(columns=["_rota_uf", "_rota_reg", "_geral", "_vendedor", "_cliente"])
+    return ped.drop(columns=["_rota_uf", "_rota_reg", "_geral", "_vendedor", "_cliente", "_vencido_em", "_resolvido_em"])
 
 
 t0 = time.time()
@@ -851,6 +977,8 @@ _d("Logística e localidade", "compra", "numérica", [
     ("taxa_atraso_destino_hist", "Taxa de atraso para a UF do cliente antes da compra"),
     ("taxa_atraso_plataforma_recente", f"Taxa de atraso de toda a plataforma nos últimos {JANELA_RECENTE_DIAS} dias (greves, picos)"),
     ("pedidos_plataforma_7d", "Volume de compras na plataforma nos 7 dias anteriores (pressão logística)"),
+    ("atrasos_abertos_plataforma", "v6: pedidos vencidos e ainda não entregues no instante da compra / vencidos nos últimos 30 dias"),
+    ("atrasos_abertos_destino", "v6: idem, na UF do cliente (suavizado pela taxa da plataforma)"),
 ])
 _d("Produto e vendedor", "compra", "categórica", [("categoria", "Categoria do item principal")])
 _d("Produto e vendedor", "compra", "numérica", [
@@ -870,11 +998,15 @@ _d("Produto e vendedor", "compra", "numérica", [
     ("vendedor_dias_entrega_hist", "Tempo médio de entrega do vendedor antes da compra"),
 ])
 _d("Calendário e cliente", "compra", "numérica", [
-    ("mes", "Mês da compra"), ("dia_semana", "Dia da semana (0 = segunda)"), ("hora", "Hora da compra"),
+    ("dia_semana", "Dia da semana (0 = segunda)"), ("hora", "Hora da compra"),
     ("fim_de_semana", "Compra no sábado ou domingo"),
     ("cliente_recorrente", "Cliente já comprou antes"),
 ])
 _d("Razões entre variáveis", "compra", "numérica", [(n, d) for n, (_, d) in RAZOES_NOVAS.items()])
+# v6: excluída por decisão de modelagem (documentada para deixar explícito por que não entra)
+_d("Excluída (aprendizado v6)", "excluída", "numérica", [
+    ("mes", "Mês da compra: com um único ano de dados, o modelo decoraria o mês em vez de aprender sazonalidade"),
+])
 # Pós-compra: documentadas para deixar explícito por que NÃO entram
 _d("Pós-compra (proibida no modelo)", "pós-compra", "alvo", [
     ("atrasou", "ALVO: entrega após a data prometida"),
@@ -1238,7 +1370,8 @@ def construir(nome):
                                   ("seleciona", SelecionaColunas(SELECIONADAS))] + etapas))
 
 
-BALANCEAMENTO = {"estrategia": ["nenhum", "pesos", "ensemble_subamostragem"], "razao": [1.0, 2.0, 3.0, 5.0]}
+# v6: sem balanceamento (testado em 14/11: não melhora a ordenação e piora a calibração)
+BALANCEAMENTO = {"estrategia": ["nenhum"], "razao": [1.0]}
 ESPACOS = {
     "Regressão Logística": {"estimador__modelo__C": [0.003, 0.01, 0.03, 0.1, 0.3, 1.0],
                             "estimador__prep__num__spline": ["passthrough",
@@ -1272,7 +1405,7 @@ print(f"Modelos testados: {MODELOS}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 7. Seleção de variáveis por matriz de correlação (30 variáveis)
+# MAGIC ## 7. Seleção de variáveis por matriz de correlação (v6: por critério, sem número fixo)
 
 # COMMAND ----------
 
@@ -1401,7 +1534,7 @@ mostrar(fig, "selecao_01b_novas_razoes")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Pesos e seleção das 30 variáveis
+# MAGIC ### Pesos e seleção das variáveis (relevância mínima + redundância)
 
 # COMMAND ----------
 
@@ -1416,18 +1549,22 @@ for r in RAZOES_APROVADAS:
         peso_bruto[r] = float(relevancia[r] * (1 - red))
 fora = [r for r in RAZOES_NOVAS if r not in selecionadas] + list(SUBSTITUIDAS)
 restantes = [f for f in relevancia.sort_values(ascending=False).index if f not in selecionadas and f not in fora]
-while len(selecionadas) < N_FEATURES:
+while len(selecionadas) < N_FEATURES_MAX and restantes:
     if selecionadas:
         red = assoc.loc[restantes, selecionadas].max(axis=1)
     else:
         red = pd.Series(0.0, index=restantes)
     score = (relevancia[restantes] * (1 - red)).where(red <= LIMIAR_REDUNDANCIA, -1.0)
     melhor = score.idxmax()
-    assert score[melhor] > 0, f"só {len(selecionadas)} variáveis passam no filtro de redundância"
+    if score[melhor] <= 0 or relevancia[melhor] < MIN_RELEVANCIA:   # v6: critério de parada
+        break
     selecionadas.append(melhor)
     peso_bruto[melhor] = float(score[melhor])
     restantes.remove(melhor)
 
+N_FEATURES = len(selecionadas)
+print(f"v6: seleção parou em {N_FEATURES} variáveis (relevância mínima {MIN_RELEVANCIA}, "
+      f"redundância máxima {LIMIAR_REDUNDANCIA}, teto {N_FEATURES_MAX})")
 pesos = pd.Series(peso_bruto)
 pesos = pesos / pesos.sum()
 
@@ -1486,133 +1623,47 @@ print(f"{len(CANDIDATAS)} candidatas -> {N_FEATURES} selecionadas ({len(CATEGORI
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 7b. Estratégias de recorte do treino: comparação na validação
+# MAGIC ## 7b. Recorte do treino: v6 recompara as estratégias na validação
 
 # COMMAND ----------
 
-# Compara as estratégias de recorte NA VALIDAÇÃO (os 3 folds), nunca no teste.
-# Para a comparação ser rápida e justa, todas usam os mesmos hiperparâmetros: os melhores da busca da versão
-# original. A busca completa (seção 8) roda depois, só para a estratégia escolhida.
+# v6: compara as estratégias de recorte nos 3 folds de VALIDAÇÃO, com parâmetros fixos e moderados
+# (a busca de hiperparâmetros vem depois, já com a estratégia escolhida). O teste não participa.
 PARAMS_COMPARACAO = {
-    "Regressão Logística": {"razao": 2.0, "estrategia": "ensemble_subamostragem",
-                            "estimador__prep__num__spline": "passthrough", "estimador__modelo__C": 0.003},
-    "Gradient Boosting": {"razao": 3.0, "estrategia": "ensemble_subamostragem", "estimador__modelo__subsample": 0.85,
-                          "estimador__modelo__n_estimators": 300, "estimador__modelo__min_samples_leaf": 200,
-                          "estimador__modelo__max_features": "sqrt", "estimador__modelo__max_depth": 4,
-                          "estimador__modelo__learning_rate": 0.03},
+    "Regressão Logística": {"estimador__modelo__C": 0.1},
+    "Gradient Boosting": {"estimador__modelo__n_estimators": 200, "estimador__modelo__learning_rate": 0.05,
+                          "estimador__modelo__max_depth": 3, "estimador__modelo__min_samples_leaf": 100,
+                          "estimador__modelo__subsample": 0.85, "estimador__modelo__max_features": "sqrt"},
+    "LightGBM": {"estimador__modelo__n_estimators": 300, "estimador__modelo__num_leaves": 31,
+                 "estimador__modelo__min_child_samples": 100},
+    "Random Forest": {"estimador__modelo__min_samples_leaf": 50},
 }
-validacoes = [(ini, bm[(TS >= ini) & (TS < fim)]) for ini, fim in FOLDS_VALIDACAO]
 
-linhas_e = []
-t0 = time.time()
-for est in ESTRATEGIAS:
-    for ini, va in validacoes:
-        tr = treino_ate(ini, est)
-        Xva, yva = Xy(va)
+if ESTRATEGIA_RECORTE == "auto":
+    linhas_rec = []
+    for est in ESTRATEGIAS_COMPARAR:
+        montar_recorte(est, mostrar_resumo=False)
         for nome in MODELOS:
-            m = construir(nome).set_params(**PARAMS_COMPARACAO[nome]).fit(*Xy(tr))
-            p = m.predict_proba(Xva)[:, 1]
-            top = p >= np.quantile(p, 0.9)
-            linhas_e.append({"estrategia": est, "fold": ini[:7], "modelo": nome, "n_treino": len(tr),
-                             "atraso_treino": tr["atrasou"].mean(), "pr_auc": average_precision_score(yva, p),
-                             "lift_pr_auc": average_precision_score(yva, p) / yva.mean(),
-                             "precisao_top10": yva[top].mean()})
-    print(f"  {est:26s} avaliada ({time.time() - t0:.0f}s)")
-comp_est = pd.DataFrame(linhas_e)
+            pr = []
+            for f_ in folds:
+                Xf, yf = Xy(f_["tr"])
+                Xv, yv = Xy(f_["va"])
+                m_ = construir(nome).set_params(**PARAMS_COMPARACAO[nome]).fit(Xf, yf)
+                pr.append(average_precision_score(yv, m_.predict_proba(Xv)[:, 1]))
+            linhas_rec.append({"estrategia": est, "modelo": nome, "pr_auc_validacao_media": float(np.mean(pr)),
+                               **{f"fold_{i + 1}": v for i, v in enumerate(pr)},
+                               "pedidos_treino_final": len(treino_final)})
+            print(f"  {est:26s} {nome:20s} PR-AUC validação {np.mean(pr):.4f}")
+    comp_recorte = pd.DataFrame(linhas_rec)
+    display(comp_recorte.round(4))
+    media_rec = comp_recorte.groupby("estrategia")["pr_auc_validacao_media"].mean().sort_values(ascending=False)
+    display(media_rec.round(4).reset_index().rename(columns={"pr_auc_validacao_media": "media_dos_modelos"}))
+    ESTRATEGIA_ESCOLHIDA = media_rec.index[0]
+    print(f"\n>>> Estratégia escolhida na validação: {ESTRATEGIA_ESCOLHIDA}")
+else:
+    ESTRATEGIA_ESCOLHIDA = ESTRATEGIA_RECORTE
 
-tab_est = (comp_est.pivot_table(index="estrategia", columns="modelo", values="pr_auc", aggfunc="mean")
-           .assign(media_modelos=lambda d: d.mean(axis=1)).sort_values("media_modelos", ascending=False))
-vitorias = (comp_est.pivot_table(index=["fold", "modelo"], columns="estrategia", values="pr_auc")
-            .idxmax(axis=1).value_counts().reindex(tab_est.index, fill_value=0))
-tab_est["folds_x_modelos_vencidos"] = vitorias
-finais_est = {est: treino_ate(FIM_TREINO_FINAL, est) for est in ESTRATEGIAS}
-tab_est["treino_final_pedidos"] = [len(finais_est[e]) for e in tab_est.index]
-tab_est["treino_final_atraso"] = [finais_est[e]["atrasou"].mean() for e in tab_est.index]
-tab_est["treino_final_meses"] = [finais_est[e]["order_purchase_timestamp"].dt.to_period("M").nunique()
-                                 for e in tab_est.index]
-tab_est.insert(0, "descricao", [ESTRATEGIAS[e] for e in tab_est.index])
-print("\nPR-AUC média nos 3 folds de validação (mesmos períodos de avaliação para todas as estratégias):")
-display(tab_est.round(4).reset_index())
-display(comp_est.pivot_table(index=["modelo", "fold"], columns="estrategia", values="pr_auc").round(4))
-
-escolhida = tab_est.index[0] if ESTRATEGIA_RECORTE == "auto" else ESTRATEGIA_RECORTE
-segunda = [e for e in tab_est.index if e != escolhida][0]
-print(f"\n>>> Estratégia de recorte: '{escolhida}' "
-      f"({'escolhida pela validação' if ESTRATEGIA_RECORTE == 'auto' else 'definida manualmente'}) | "
-      f"vantagem sobre '{segunda}': {tab_est.loc[escolhida, 'media_modelos'] - tab_est.loc[segunda, 'media_modelos']:+.4f} de PR-AUC")
-
-# ------------------------------------------------------------------ Gráfico A: desempenho na validação
-fig, axes = plt.subplots(1, 2, figsize=(20, 5.5), gridspec_kw={"width_ratios": [1.4, 1]})
-ax = axes[0]
-ordem_e = list(tab_est.index)
-cores_m = dict(zip(MODELOS, sns.color_palette("deep", len(MODELOS))))
-larg = 0.8 / len(MODELOS)
-for k, nome in enumerate(MODELOS):
-    x = np.arange(len(ordem_e)) + (k - (len(MODELOS) - 1) / 2) * larg
-    ax.bar(x, tab_est.loc[ordem_e, nome], larg, color=cores_m[nome], label=f"{nome} (média dos folds)")
-    pontos = comp_est[comp_est["modelo"] == nome]
-    for i, e in enumerate(ordem_e):
-        v = pontos.loc[pontos["estrategia"] == e, "pr_auc"]
-        ax.scatter([x[i]] * len(v), v, color="black", s=12, zorder=5)
-ax.set_xticks(np.arange(len(ordem_e)))
-ax.set_xticklabels(ordem_e, rotation=20, ha="right")
-ax.set_ylabel("PR-AUC na validação")
-ax.set_title("Estratégias de recorte: PR-AUC na validação (pontos = cada fold)")
-ax.legend(fontsize=8)
-
-ax = axes[1]
-x = np.arange(len(ordem_e))
-ax.bar(x, tab_est.loc[ordem_e, "treino_final_pedidos"], color="#9DB4D8")
-ax.set_ylabel("Pedidos no treino final")
-ax.set_xticks(x)
-ax.set_xticklabels(ordem_e, rotation=20, ha="right")
-ax2 = ax.twinx()
-ax2.plot(x, tab_est.loc[ordem_e, "treino_final_atraso"], color="#C44E52", marker="o", lw=2, label="Atraso do treino")
-ax2.axhline(calib["atrasou"].mean(), color="#DD8452", ls="--", lw=1.2, label="Atraso da calibração")
-ax2.yaxis.set_major_formatter(PCT)
-ax2.set_ylim(0, max(tab_est["treino_final_atraso"].max(), calib["atrasou"].mean()) * 1.4)
-ax2.grid(False)
-ax2.legend(fontsize=8, loc="upper right")
-ax.set_title("Treino final de cada estratégia: volume (barras) e taxa de atraso")
-mostrar(fig, "estrategias_01_validacao")
-
-# ------------------------------------------------------------------ Gráfico B: quais meses cada estratégia usa
-meses_ant = sorted(m for m in bm["ano_mes"].unique() if m < INICIO_TESTE[:7])
-pool = base_conhecida(FIM_TREINO_FINAL)
-n_pool = pool.groupby("ano_mes").size().reindex(meses_ant, fill_value=0)
-uso = pd.DataFrame({e: (finais_est[e].groupby("ano_mes").size().reindex(meses_ant, fill_value=0)
-                        / n_pool.where(n_pool > 0)) for e in ordem_e}).T.fillna(0)
-fig, axes = plt.subplots(2, 1, figsize=(18, 8), gridspec_kw={"height_ratios": [1, 2.2]}, sharex=False)
-taxa_m = bm[bm["ano_mes"].isin(meses_ant)].groupby("ano_mes")["atrasou"].mean().reindex(meses_ant)
-axes[0].plot(range(len(meses_ant)), taxa_m.values, color="#C44E52", marker="o")
-for i, v in enumerate(taxa_m.values):
-    axes[0].annotate(f"{v:.1%}", (i, v), textcoords="offset points", xytext=(0, 6), ha="center", fontsize=7)
-axes[0].set_xlim(-0.5, len(meses_ant) - 0.5)
-axes[0].set_xticks(range(len(meses_ant)))
-axes[0].set_xticklabels([])
-axes[0].yaxis.set_major_formatter(PCT)
-axes[0].set_ylim(0, taxa_m.max() * 1.3)
-axes[0].set_title("Taxa de atraso do mês (em cima) e parte de cada mês que entra no treino final de cada estratégia (embaixo)")
-sns.heatmap(uso, annot=True, fmt=".0%", cmap="Blues", vmin=0, vmax=1, cbar=False, ax=axes[1],
-            annot_kws={"size": 7}, xticklabels=meses_ant)
-axes[1].tick_params(axis="x", rotation=70)
-axes[1].set_ylabel("")
-mostrar(fig, "estrategias_02_meses_usados")
-
-# ------------------------------------------------------------------ Diagnóstico opcional no teste
-if MOSTRAR_TESTE_DE_TODAS:
-    print("DIAGNÓSTICO (não use para escolher a estratégia: escolher pelo teste invalida a nota final)")
-    Xte_d, yte_d = Xy(teste)
-    diag = []
-    for est in ordem_e:
-        for nome in MODELOS:
-            m = construir(nome).set_params(**PARAMS_COMPARACAO[nome]).fit(*Xy(finais_est[est]))
-            diag.append({"estrategia": est, "modelo": nome,
-                         "pr_auc_teste": average_precision_score(yte_d, m.predict_proba(Xte_d)[:, 1])})
-    display(pd.DataFrame(diag).pivot(index="estrategia", columns="modelo", values="pr_auc_teste").round(4))
-
-# Daqui em diante o notebook usa a estratégia escolhida (busca, treino final, calibração e teste)
-montar_recorte(escolhida)
+montar_recorte(ESTRATEGIA_ESCOLHIDA)
 
 # COMMAND ----------
 
@@ -1751,7 +1802,7 @@ display(equilibrio.round(4))
 # COMMAND ----------
 
 import pickle
-ARQ_BUSCA = os.path.join(SAIDA_DIR, f"buscas_{N_FEATURES}vars_{ASSINATURA}_bal_v30_{VERSAO_RECORTE}.pkl")
+ARQ_BUSCA = os.path.join(SAIDA_DIR, f"buscas_{N_FEATURES}vars_{ASSINATURA}_v6_{VERSAO_RECORTE}.pkl")
 if os.path.exists(ARQ_BUSCA) and not MODO_RAPIDO:
     with open(ARQ_BUSCA, "rb") as f:
         buscas = pickle.load(f)
@@ -1779,9 +1830,64 @@ else:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 9. Treino final, calibração e avaliação no teste
+# MAGIC ## 9. Treino final, correção de prevalência, política de alerta e avaliação no teste
 
 # COMMAND ----------
+
+from scipy.optimize import brentq
+from scipy.special import expit, logit
+
+
+class CorrecaoPrevalencia:
+    """Calibração SEM mês extra: ajusta só o intercepto (no logit) para que a probabilidade média prevista no
+    treino REAL seja igual à taxa real de atraso do treino. O balanceamento infla as probabilidades; esta correção
+    desfaz a inflação sem mudar a ordem dos pedidos. Usa só o treino, então nenhum mês fica reservado
+    para calibrar e o treino pode chegar até o mês mais recente disponível."""
+    def __init__(self, base, X, y):
+        z = logit(np.clip(base.predict_proba(X)[:, 1], 1e-7, 1 - 1e-7))
+        alvo = float(np.mean(y))
+        self.deslocamento = brentq(lambda b: expit(z + b).mean() - alvo, -30, 30)
+        self.base, self.classes_, self.taxa_alvo = base, base.classes_, alvo
+
+    def predict_proba(self, X):
+        q = expit(logit(np.clip(self.base.predict_proba(X)[:, 1], 1e-7, 1 - 1e-7)) + self.deslocamento)
+        return np.column_stack([1 - q, q])
+
+
+def metricas_faixa(y, p, faixa):
+    """Sinaliza os `faixa` x 100% pedidos de maior risco e mede o resultado."""
+    alerta = p >= np.quantile(p, 1 - faixa)
+    vp = (alerta & (y == 1)).sum()
+    fp = (alerta & (y == 0)).sum()
+    rec = vp / max(y.sum(), 1)
+    esp = 1 - fp / max((y == 0).sum(), 1)
+    prec = vp / max(alerta.sum(), 1)
+    return {"faixa": faixa, "recall": rec, "acuracia": (alerta == (y == 1)).mean(), "precisao": prec,
+            "especificidade": esp, "acuracia_balanceada": (rec + esp) / 2,
+            "f1": 2 * prec * rec / max(prec + rec, 1e-12), "lift": prec / y.mean()}
+
+
+def escolher_faixa(curva, criterio=None):
+    """Escolhe a faixa de alerta na curva MÉDIA DA VALIDAÇÃO (nunca no teste)."""
+    criterio = criterio or CRITERIO_FAIXA
+    if criterio == "equilibrio":
+        i = (curva["recall"] - curva["acuracia"]).abs().idxmin()
+    elif criterio == "f1":
+        i = curva["f1"].idxmax()
+    elif criterio == "youden":
+        i = curva["acuracia_balanceada"].idxmax()
+    elif criterio == "custo":
+        # custo por pedido = RAZAO_CUSTO x (atrasos perdidos) + 1 x (alarmes falsos), na curva média da validação
+        taxa = curva["precisao"] / curva["lift"]
+        custo = RAZAO_CUSTO * taxa * (1 - curva["recall"]) + curva["faixa"] * (1 - curva["precisao"])
+        i = custo.idxmin()
+    elif criterio == "recall_minimo":
+        ok = curva[curva["recall"] >= RECALL_MINIMO]
+        i = ok["acuracia"].idxmax() if len(ok) else curva["recall"].idxmax()
+    else:
+        raise ValueError(criterio)
+    return float(curva.loc[i, "faixa"])
+
 
 import pickle
 import cloudpickle
@@ -1806,6 +1912,8 @@ def calibrar(modelo, X, y):
 
 def modelos_base(modelo):
     """Pipelines originais (um por membro do ensemble), sem calibrador e sem wrapper de balanceamento."""
+    if isinstance(modelo, CorrecaoPrevalencia):
+        modelo = modelo.base
     if isinstance(modelo, CalibratedClassifierCV):
         est = modelo.calibrated_classifiers_[0].estimator
         modelo = getattr(est, "estimator", est)
@@ -1878,15 +1986,15 @@ Xtr, ytr = Xy(treino_final)
 Xcal, ycal = Xy(calib)
 Xte, yte = Xy(teste)
 datas_te = teste["order_purchase_timestamp"].to_numpy()
-DIR_CHECKPOINT = os.path.join(SAIDA_DIR, f"checkpoint_finais_{N_FEATURES}vars_{ASSINATURA}_bal_v30_{VERSAO_RECORTE}")
+DIR_CHECKPOINT = os.path.join(SAIDA_DIR, f"checkpoint_finais_{N_FEATURES}vars_{ASSINATURA}_v6_{VERSAO_FINAL}")
 os.makedirs(DIR_CHECKPOINT, exist_ok=True)
 
-finais, res, prev, imp_nativa = {}, {}, {}, {}
+finais, res, prev, imp_nativa, curvas_val = {}, {}, {}, {}, {}
 for nome in MODELOS:
     arq = os.path.join(DIR_CHECKPOINT, f"{nome.replace(' ', '_')}.pkl")
     if os.path.exists(arq):
         with open(arq, "rb") as f:
-            res[nome], prev[nome], imp_nativa[nome] = pickle.load(f)
+            res[nome], prev[nome], imp_nativa[nome], curvas_val[nome] = pickle.load(f)
         print(f"{nome:20s} carregado do checkpoint")
         continue
     params = buscas[nome]["params"].iloc[0]
@@ -1894,7 +2002,24 @@ for nome in MODELOS:
     t0 = time.time()
     base_m = construir(nome).set_params(**params).fit(Xtr, ytr)
     t_treino = time.time() - t0
-    modelo = calibrar(base_m, Xcal, ycal) if CALIBRAR else base_m
+    if CALIBRACAO == "prevalencia":
+        modelo = CorrecaoPrevalencia(base_m, Xtr, ytr)
+    elif CALIBRACAO == "sigmoide":
+        modelo = calibrar(base_m, Xcal, ycal)
+    else:
+        modelo = base_m
+
+    # Política de alerta escolhida na VALIDAÇÃO: os mesmos parâmetros treinados em cada fold, avaliados no
+    # período seguinte. Também mede o lift na validação (diagnóstico de overfitting).
+    curvas_f, lifts_va = [], []
+    for f_ in folds:
+        Xf, yf = Xy(f_["tr"])
+        Xv, yv = Xy(f_["va"])
+        pv = construir(nome).set_params(**params).fit(Xf, yf).predict_proba(Xv)[:, 1]
+        curvas_f.append(pd.DataFrame([metricas_faixa(yv, pv, fx) for fx in FAIXAS_ALERTA]))
+        lifts_va.append(average_precision_score(yv, pv) / yv.mean())
+    curva_val = pd.concat(curvas_f).groupby("faixa", as_index=False).mean()
+    faixa = escolher_faixa(curva_val)
     t0 = time.time()
     p = modelo.predict_proba(Xte)[:, 1]
     ms_1000 = (time.time() - t0) / len(yte) * 1e6
@@ -1905,7 +2030,12 @@ for nome in MODELOS:
         "params": params,
         "pr_auc_cv": buscas[nome]["pr_auc_cv"].iloc[0],
         "brier_sem_calibracao": brier_score_loss(yte, p_sem),
-        "limiar": limiar_f1(ycal, modelo.predict_proba(Xcal)[:, 1]),
+        "faixa_alerta": faixa,
+        "limiar": float(np.quantile(p, 1 - faixa)),   # corte da faixa: usa só os scores, nunca os rótulos do teste
+        "acuracia_alerta": metricas_faixa(yte, p, faixa)["acuracia"],
+        "recall_alerta": metricas_faixa(yte, p, faixa)["recall"],
+        "lift_treino": average_precision_score(ytr, base_m.predict_proba(Xtr)[:, 1]) / ytr.mean(),
+        "lift_validacao": float(np.mean(lifts_va)),
         "segundos_treino": t_treino,
         "ms_por_1000_previsoes": ms_1000,
         "interpretabilidade": INTERPRETABILIDADE[nome],
@@ -1915,21 +2045,75 @@ for nome in MODELOS:
     except Exception as e:                         # a importância nunca deve derrubar o treino
         print(f"  importância de {nome} não calculada ({type(e).__name__}: {e})")
         imp_nome = pd.Series(dtype=float)
-    finais[nome], res[nome], prev[nome], imp_nativa[nome] = modelo, m, p, imp_nome
+    finais[nome], res[nome], prev[nome], imp_nativa[nome], curvas_val[nome] = modelo, m, p, imp_nome, curva_val
     with open(arq, "wb") as f:                     # só métricas e previsões: arquivo pequeno e rápido
-        pickle.dump((res[nome], prev[nome], imp_nativa[nome]), f)
+        pickle.dump((res[nome], prev[nome], imp_nativa[nome], curvas_val[nome]), f)
     print(f"{nome:20s} pronto em {t_treino:.0f}s")
 
 print()
 for nome, m in res.items():
     print(f"{nome:20s} TESTE PR-AUC {m['pr_auc']:.4f} (IC95 {m['pr_auc_ic95'][0]:.4f}-{m['pr_auc_ic95'][1]:.4f}) | "
           f"ROC-AUC {m['roc_auc']:.4f} | Brier {m['brier_sem_calibracao']:.4f} -> {m['brier']:.4f} | "
-          f"top10% {m['precisao_top10']:.1%}")
+          f"top10% {m['precisao_top10']:.1%} | alerta nos {m['faixa_alerta']:.0%} de maior risco: "
+          f"acurácia {m['acuracia_alerta']:.1%}, recall {m['recall_alerta']:.1%}")
 
 # Referência sem machine learning: taxa histórica de atraso da rota
 p_ref = teste["taxa_atraso_rota_hist"].fillna(ytr.mean()).to_numpy()
 ref = avaliar(yte, p_ref, datas_te)
 print(f"\nReferência (taxa da rota) PR-AUC {ref['pr_auc']:.4f} | acaso = taxa base {ref['taxa_base']:.4f}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Política de alerta: acurácia x recall por faixa, e diagnóstico de overfitting
+
+# COMMAND ----------
+
+# Política de alerta: sinalizar os X% de pedidos de maior risco. X foi escolhido na VALIDAÇÃO (média dos 3 folds),
+# pelo critério CRITERIO_FAIXA. Aqui aparece a curva inteira, na validação e no teste, para mostrar a troca entre
+# acurácia e recall. Uma faixa fixa de pedidos (em vez de um limiar de probabilidade) não se desloca quando a
+# probabilidade média muda de um período para outro: foi isso que fez a v3 e a v4 sinalizarem quase 60% dos pedidos.
+linhas_p = []
+for nome in MODELOS:
+    for f_ in FAIXAS_ALERTA:
+        val = curvas_val[nome].set_index("faixa").loc[f_]
+        te = metricas_faixa(yte, prev[nome], f_)
+        linhas_p.append({"modelo": nome, "faixa_sinalizada": f_, "recall_validacao": val["recall"],
+                         "acuracia_validacao": val["acuracia"], "recall_teste": te["recall"],
+                         "acuracia_teste": te["acuracia"], "precisao_teste": te["precisao"], "lift_teste": te["lift"],
+                         "escolhida": np.isclose(f_, res[nome]["faixa_alerta"])})
+politica = pd.DataFrame(linhas_p)
+print(f"Critério da faixa: '{CRITERIO_FAIXA}' (escolhido na validação)")
+display(politica.round(4))
+
+fig, axes = plt.subplots(1, len(MODELOS), figsize=(9 * len(MODELOS), 4.8), squeeze=False)
+for ax, nome in zip(axes[0], MODELOS):
+    d = politica[politica["modelo"] == nome]
+    ax.plot(d["faixa_sinalizada"], d["acuracia_teste"], color="#4C72B0", lw=2, marker="o", label="Acurácia (teste)")
+    ax.plot(d["faixa_sinalizada"], d["recall_teste"], color="#C44E52", lw=2, marker="o", label="Recall (teste)")
+    ax.plot(d["faixa_sinalizada"], d["acuracia_validacao"], color="#4C72B0", lw=1, ls="--", label="Acurácia (validação)")
+    ax.plot(d["faixa_sinalizada"], d["recall_validacao"], color="#C44E52", lw=1, ls="--", label="Recall (validação)")
+    ax.plot(d["faixa_sinalizada"], d["faixa_sinalizada"], color="gray", lw=1, ls=":", label="Recall do acaso")
+    ax.axvline(res[nome]["faixa_alerta"], color="black", lw=1)
+    ax.annotate(f"faixa escolhida: {res[nome]['faixa_alerta']:.0%}", (res[nome]["faixa_alerta"], 0.03),
+                rotation=90, ha="right", va="bottom", fontsize=8)
+    ax.xaxis.set_major_formatter(PCT)
+    ax.yaxis.set_major_formatter(PCT)
+    ax.set_ylim(0, 1)
+    ax.set_xlabel("% de pedidos sinalizados (maior risco primeiro)")
+    ax.set_title(f"{nome}: acurácia x recall por faixa de alerta", fontsize=10)
+    ax.legend(fontsize=8, loc="center right")
+mostrar(fig, f"politica_alerta_{VERSAO_FINAL}")
+
+# Diagnóstico de overfitting: lift (PR-AUC / taxa base) no treino real, na validação e no teste
+diag = pd.DataFrame([{"modelo": n, "lift_treino": res[n]["lift_treino"], "lift_validacao": res[n]["lift_validacao"],
+                      "lift_teste": res[n]["pr_auc"] / yte.mean()} for n in MODELOS])
+diag["queda_treino_teste_pct"] = (1 - diag["lift_teste"] / diag["lift_treino"]) * 100
+print("\nOverfitting: lift = PR-AUC / taxa base (compara conjuntos com taxas de atraso diferentes).")
+display(diag.round(3))
+for _, r_ in diag.iterrows():
+    print(f"  {r_['modelo']:20s} queda de lift treino -> teste {r_['queda_treino_teste_pct']:.0f}% "
+          f"({'ATENÇÃO' if r_['queda_treino_teste_pct'] > 50 else 'ok'})")
 
 # COMMAND ----------
 
@@ -1990,47 +2174,62 @@ print(f"\n>>> MODELO ESCOLHIDO: {vencedor}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Comparação com a versão original
+# MAGIC ### Comparação entre todas as versões (original, v1 a v6)
+# MAGIC
+# MAGIC **Atenção:** comparar várias versões no mesmo teste é útil para mostrar a evolução, mas nenhuma escolha deve ser feita olhando esta tabela. Na v6, recorte, variáveis, hiperparâmetros e faixa de alerta foram escolhidos só na validação.
 
 # COMMAND ----------
 
-# Comparação com a versão ORIGINAL (janela expansiva jan-nov/2017, calibração jan-mar/2018), mesmo teste abr-ago/2018.
-# Valores da execução original (olist_atraso_pipeline_30vars_bal), copiados da saída da seção 9.
-ORIGINAL = {
-    "Regressão Logística": {"pr_auc": 0.1300, "roc_auc": 0.7077, "brier": 0.0586, "precisao_top10": 0.1633},
-    "Random Forest": {"pr_auc": 0.0976, "roc_auc": 0.6510, "brier": 0.0627, "precisao_top10": 0.1316},
-    "Gradient Boosting": {"pr_auc": 0.0997, "roc_auc": 0.6776, "brier": 0.0669, "precisao_top10": 0.1177},
-    "LightGBM": {"pr_auc": 0.1020, "roc_auc": 0.6909, "brier": 0.0600, "precisao_top10": 0.1251},
+# Comparação de TODAS as versões no mesmo teste (abr-ago/2018). Valores das versões anteriores copiados das saídas
+# de cada execução. "% sinalizados", acurácia e recall são medidos no ponto de alerta de cada versão.
+VERSOES = {
+    "original": {"Regressão Logística": dict(pr_auc=0.1301, brier=0.0587, precisao_top10=0.163, acuracia=0.699, recall=0.596, sinalizados=0.311),
+                 "Gradient Boosting": dict(pr_auc=0.0995, brier=0.0669, precisao_top10=0.118, acuracia=0.541, recall=0.723, sinalizados=0.483)},
+    "v1 (5 meses)": {"Regressão Logística": dict(pr_auc=0.1091, brier=0.0580, precisao_top10=0.132, acuracia=0.801, recall=0.400, sinalizados=0.188),
+                     "Gradient Boosting": dict(pr_auc=0.0977, brier=0.0644, precisao_top10=0.120, acuracia=0.705, recall=0.517, sinalizados=0.297)},
+    "v2 (equilibrado)": {"Regressão Logística": dict(pr_auc=0.1307, brier=0.0653, precisao_top10=0.161, acuracia=0.708, recall=0.594, sinalizados=0.302),
+                         "Gradient Boosting": dict(pr_auc=0.1182, brier=0.0632, precisao_top10=0.137, acuracia=0.750, recall=0.480, sinalizados=0.248)},
+    "v3 (calib. jan/18)": {"Regressão Logística": dict(pr_auc=0.0999, brier=0.0690, precisao_top10=0.116, acuracia=0.432, recall=0.832, sinalizados=0.603),
+                           "Gradient Boosting": dict(pr_auc=0.1057, brier=0.0578, precisao_top10=0.122, acuracia=0.554, recall=0.759, sinalizados=0.474)},
+    "v4 (oversampling)": {"Regressão Logística": dict(pr_auc=0.1033, brier=0.0604, precisao_top10=0.122, acuracia=0.465, recall=0.817, sinalizados=0.569),
+                          "Gradient Boosting": dict(pr_auc=0.1050, brier=0.0587, precisao_top10=0.122, acuracia=0.437, recall=0.849, sinalizados=0.600)},
 }
-METRICAS_COMP = {"pr_auc": "PR-AUC (maior = melhor)", "roc_auc": "ROC-AUC (maior = melhor)",
-                 "brier": "Brier calibrado (menor = melhor)", "precisao_top10": "Precisão top 10% (maior = melhor)"}
-linhas_c = []
-for nome in MODELOS:
-    for met, rotulo in METRICAS_COMP.items():
-        o, n = ORIGINAL[nome][met], float(res[nome][met])
-        melhorou = n < o if met == "brier" else n > o
-        linhas_c.append({"modelo": nome, "métrica": rotulo, "original": o, f"novo ({VERSAO_RECORTE})": n,
-                         "diferença": n - o, "melhorou": melhorou})
-comp_versoes = pd.DataFrame(linhas_c)
+VERSOES["v5 (consolidada)"] = {
+    "Regressão Logística": dict(pr_auc=0.1306, brier=0.0488, precisao_top10=0.1606, acuracia=0.620, recall=0.688, sinalizados=0.40),
+    "Gradient Boosting": dict(pr_auc=0.1177, brier=0.0497, precisao_top10=0.1365, acuracia=0.617, recall=0.657, sinalizados=0.40)}
+VERSOES["v6 (esta)"] = {m: dict(pr_auc=float(res[m]["pr_auc"]), brier=float(res[m]["brier"]),
+                                precisao_top10=float(res[m]["precisao_top10"]), acuracia=float(res[m]["acuracia_alerta"]),
+                                recall=float(res[m]["recall_alerta"]), sinalizados=float(res[m]["faixa_alerta"]))
+                        for m in MODELOS}
+for v in VERSOES:
+    for m in MODELOS:
+        d = VERSOES[v][m]
+        d["lift_alerta"] = d["recall"] / d["sinalizados"]
+METRICAS_COMP = {"pr_auc": "PR-AUC", "precisao_top10": "Precisão top 10%", "brier": "Brier (menor = melhor)",
+                 "lift_alerta": "Lift no ponto de alerta", "acuracia": "Acurácia no alerta", "recall": "Recall no alerta"}
+comp_versoes = pd.DataFrame([{"modelo": m, "métrica": rot, **{v: VERSOES[v][m][met] for v in VERSOES}}
+                             for m in MODELOS for met, rot in METRICAS_COMP.items()])
 brier_constante = yte.mean() * (1 - yte.mean())
-print(f"Referência de Brier: prever sempre a taxa base do teste ({yte.mean():.2%}) dá Brier {brier_constante:.4f}. "
-      f"Um modelo calibrado deveria ficar ABAIXO disso.")
+print(f"Brier de prever sempre a taxa base ({yte.mean():.2%}): {brier_constante:.4f} (o ideal é ficar abaixo)")
 display(comp_versoes.round(4))
 
-fig, axes = plt.subplots(1, len(METRICAS_COMP), figsize=(18, 4))
-for ax, (met, rotulo) in zip(axes, METRICAS_COMP.items()):
+cores_v = sns.color_palette("Blues", len(VERSOES))
+fig, axes = plt.subplots(2, 3, figsize=(21, 8.5))
+for ax, (met, rotulo) in zip(axes.ravel(), METRICAS_COMP.items()):
     x = np.arange(len(MODELOS))
-    ax.bar(x - 0.2, [ORIGINAL[m][met] for m in MODELOS], 0.4, label="Original (expansiva)", color="#9DB4D8")
-    ax.bar(x + 0.2, [float(res[m][met]) for m in MODELOS], 0.4, label=f"Nova ({VERSAO_RECORTE})", color="#4C72B0")
+    larg = 0.8 / len(VERSOES)
+    for k, (v, cor) in enumerate(zip(VERSOES, cores_v)):
+        ax.bar(x + (k - (len(VERSOES) - 1) / 2) * larg, [VERSOES[v][m][met] for m in MODELOS], larg, color=cor,
+               label=v, edgecolor="black" if v.startswith("v6") else "none")
     if met == "brier":
         ax.axhline(brier_constante, color="red", ls=":", lw=1.2, label="Prever sempre a taxa base")
-    if met == "pr_auc":
-        ax.axhline(yte.mean(), color="red", ls=":", lw=1.2, label="Acaso")
+    if met in ("acuracia", "recall", "precisao_top10"):
+        ax.yaxis.set_major_formatter(PCT)
     ax.set_xticks(x)
-    ax.set_xticklabels(MODELOS, fontsize=8)
+    ax.set_xticklabels(MODELOS, fontsize=9)
     ax.set_title(rotulo, fontsize=10)
-axes[0].legend(fontsize=7)
-mostrar(fig, f"comparacao_versoes_{VERSAO_RECORTE}")
+axes[0, 0].legend(fontsize=7, ncol=2)
+mostrar(fig, f"comparacao_versoes_{VERSAO_FINAL}")
 
 # COMMAND ----------
 
@@ -2062,7 +2261,7 @@ print(f"Spearman entre peso e importância: {stats.spearmanr(comp.iloc[:, 0], co
 # COMMAND ----------
 
 # Matrizes de confusão: os modelos testados no TESTE (abr-ago/2018), em dois pontos de corte
-#  1) Limiar F1: escolhido na calibração (período de calibração), nunca no teste
+#  1) Faixa de alerta (X% de maior risco), X escolhido na validação, nunca no teste
 #  2) Top 10% de maior risco: a "faixa vermelha" usada na matriz de decisão
 # Usa prev, res, yte e MODELOS das células anteriores (rode a seção de treino final antes).
 
@@ -2078,7 +2277,7 @@ def metricas_corte(y, pred):
 
 
 CORTES = {
-    "Limiar F1 (calibração)": lambda nome, p: (p >= res[nome]["limiar"]).astype(int),
+    "Alerta: faixa escolhida na validação": lambda nome, p: (p >= res[nome]["limiar"]).astype(int),
     "Top 10% de risco": lambda nome, p: (p >= np.quantile(p, 0.9)).astype(int),
 }
 
@@ -2148,7 +2347,7 @@ for nome in MODELOS:
 pr_r, rc_r, _ = precision_recall_curve(yte, p_ref)
 ax.plot(rc_r, pr_r, color="gray", ls="--", lw=1.2, label=f"Referência: taxa da rota ({ref['pr_auc']:.3f})")
 ax.axhline(base_te, color="red", ls=":", lw=1.5, label=f"Acaso = taxa base ({base_te:.3f})")
-ax.scatter([], [], marker="o", color="white", edgecolor="black", label="Limiar F1 (calibração)")
+ax.scatter([], [], marker="o", color="white", edgecolor="black", label="Faixa de alerta (validação)")
 ax.scatter([], [], marker="s", color="white", edgecolor="black", label="Top 10% de risco")
 ax.set(xlabel="Recall (atrasos capturados)", ylabel="Precisão (alertas corretos)",
        title="Curva Precision-Recall | teste abr-ago/2018", xlim=(0, 1), ylim=(0, 0.5))

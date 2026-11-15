@@ -4,9 +4,21 @@
 # environment_version = "6"
 # ///
 # MAGIC %md
-# MAGIC # Atraso de entrega Olist: Nova Janela 
+# MAGIC # Atraso de entrega Olist: v5, versão consolidada
 # MAGIC
+# MAGIC **Diagnóstico das versões anteriores (mesmo teste, abr-ago/2018):**
 # MAGIC
+# MAGIC - **Melhor ordenação:** a v2 (recorte equilibrado sem meses atípicos, treino até jan/2018). Regressão Logística com PR-AUC 0,131 e Gradient Boosting com 0,118.
+# MAGIC - **Por que a v3 e a v4 pioraram (PR-AUC ~0,10):** o treino passou a terminar em nov/2017 para liberar jan/2018 para a calibração. Assim o modelo perdeu o mês mais recente e nunca viu as variáveis de "atraso recente" em alta, como estão logo após a crise de fev-mar/2018.
+# MAGIC - **Por que a v3 e a v4 sinalizaram ~60% dos pedidos:** o limiar de probabilidade foi escolhido em jan/2018. Em abril, logo após a crise, todas as probabilidades sobem, e o limiar disparou para quase todo mundo.
+# MAGIC - **Oversampling e SMOTE (v4):** não superaram `pesos` nem o `ensemble_subamostragem` na validação.
+# MAGIC
+# MAGIC **O que a v5 faz:**
+# MAGIC
+# MAGIC 1. **Volta ao recorte e aos hiperparâmetros da v2.** Reaproveita a busca salva da v2 e não busca de novo no teste.
+# MAGIC 2. **Calibra sem mês extra:** corrige a inflação de probabilidade do balanceamento usando só o treino (correção de prevalência).
+# MAGIC 3. **Alerta por faixa:** sinaliza os X% de pedidos de maior risco, com X escolhido na validação pelo critério `CRITERIO_FAIXA`. Uma faixa não se desloca quando a probabilidade média muda.
+# MAGIC 4. **Diagnóstico de overfitting por lift** (treino, validação e teste) e **comparação de todas as versões**.
 
 # COMMAND ----------
 
@@ -20,6 +32,10 @@
 # COMMAND ----------
 
 dbutils.library.restartPython()
+
+# COMMAND ----------
+
+
 
 # COMMAND ----------
 
@@ -51,15 +67,27 @@ FOLDS_VALIDACAO = [
     ("2017-10-01", "2018-01-01"),
     ("2018-01-01", "2018-04-01"),
 ]
-
-# ---- RECORTE DA VERSÃO NOVA: janela deslizante
 INICIO_TESTE = "2018-04-01"       # teste igual ao da versão original (abr-ago/2018): comparação justa
-MESES_TREINO = 5                  # treino usa só os N meses MAIS RECENTES antes de cada corte (teste 3, 5, 8...)
 MESES_CALIBRACAO = 1              # meses logo antes do teste reservados para calibrar e escolher o limiar
 EMBARGO_DIAS = 30                 # pedidos comprados nos 30 dias antes de um corte não entram no treino
 FIM_TREINO_FINAL = str((pd.Timestamp(INICIO_TESTE) - pd.DateOffset(months=MESES_CALIBRACAO)).date())
-CALIBRAR = True                   # calibrador sigmoide ajustado no período de calibração (Brier sem calibração é reportado)
-VERSAO_RECORTE = f"janela{MESES_TREINO}m"   # entra no nome dos arquivos salvos: não reaproveita a busca da versão original
+CALIBRAR = True                   # mantido por compatibilidade; a v5 usa CALIBRACAO abaixo
+
+# ---- v5: consolidação
+VERSAO_FINAL = "v5_consolidada"   # nome dos checkpoints do treino final (a busca da v2 é reaproveitada)
+CALIBRACAO = "prevalencia"        # "prevalencia" = corrige a inflação do balanceamento usando só o treino
+                                  # "sigmoide"    = calibrador no mês de calibração (como na v2)
+FAIXAS_ALERTA = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50]   # % de pedidos sinalizados testados
+CRITERIO_FAIXA = "equilibrio"     # "equilibrio" (recall ~ acurácia) | "f1" | "youden" | "recall_minimo"
+RECALL_MINIMO = 0.50              # usado só pelo critério "recall_minimo"
+
+# ---- RECORTE DO TREINO (seção 7b compara as estratégias na validação)
+ESTRATEGIA_RECORTE = "equilibrado_sem_atipicos"   # vencedora da comparação da v2 (fixa: não recompara)
+ESTRATEGIA_SELECAO = "expansiva"  # recorte usado só na seleção de variáveis (igual à versão original)
+MESES_TREINO = 5                  # usado pela estratégia "recentes"
+FATOR_ATIPICO = 1.5               # mês atípico = taxa de atraso acima de 1,5x a mediana mensal do próprio treino
+MIN_PEDIDOS_MES = 300             # meses com menos pedidos não são classificados como atípicos
+MOSTRAR_TESTE_DE_TODAS = False    # True = diagnóstico no teste de todas as estratégias (NÃO usar para escolher)
 
 # Modelos testados nesta versão (os outros continuam definidos e podem voltar à lista)
 MODELOS_TESTADOS = ["Regressão Logística", "Gradient Boosting"]
@@ -955,7 +983,7 @@ print(f"Auditoria OK (taxa base {y_dev.mean():.3f}): só o controle pós-compra 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 5. Estratégia de validação temporal (janela deslizante)
+# MAGIC ## 5. Estratégia de validação temporal (recorte configurável)
 
 # COMMAND ----------
 
@@ -964,214 +992,125 @@ bm = base_feat[(base_feat["elegivel"] == 1)
 bm["atrasou"] = bm["atrasou"].astype(int)
 TS = bm["order_purchase_timestamp"]
 
+# Estratégias de recorte do treino. TODAS usam só pedidos comprados antes de (corte - embargo) e com resultado já
+# conhecido no corte: nenhuma olha o período de validação, calibração ou teste para decidir quais meses entram.
+ESTRATEGIAS = {
+    "expansiva": "Todo o histórico antes do corte (versão original)",
+    "recentes": f"Só os {MESES_TREINO} meses mais recentes",
+    "alternados": "Meses alternados (1 sim, 1 não), contando do mais recente para trás",
+    "sem_atipicos": f"Todo o histórico, sem meses atípicos (atraso > {FATOR_ATIPICO}x a mediana mensal)",
+    "volume_equilibrado": "Todo o histórico, cada mês limitado à mediana de pedidos por mês",
+    "equilibrado_sem_atipicos": "Sem meses atípicos e com cada mês limitado à mediana de pedidos",
+}
+
+
+def mes_num(ts):
+    """Mês como número inteiro (ano*12 + mês): facilita contar 'meses para trás'."""
+    return ts.dt.year * 12 + ts.dt.month
+
+
+def base_conhecida(corte):
+    """Tudo o que seria utilizável no corte: comprado antes do embargo e com resultado conhecido."""
+    corte = pd.Timestamp(corte)
+    return bm[(TS < corte - pd.Timedelta(days=EMBARGO_DIAS)) & (bm["data_conhecimento_alvo"] < corte)]
+
 
 def limites_janela(corte, meses=MESES_TREINO):
-    """Início e fim (exclusivo) das compras de treino para um corte: os `meses` mais recentes antes do embargo."""
+    """Início (arredondado para o 1º dia do mês mais próximo) e fim da janela dos `meses` mais recentes."""
     fim = pd.Timestamp(corte) - pd.Timedelta(days=EMBARGO_DIAS)
     x = fim - pd.DateOffset(months=meses)
-    mes_ini = x.to_period("M").start_time                     # início arredondado para o 1º dia do mês mais
-    prox = mes_ini + pd.DateOffset(months=1)                  # próximo: a janela cobre meses (quase) inteiros
+    mes_ini = x.to_period("M").start_time
+    prox = mes_ini + pd.DateOffset(months=1)
     return (mes_ini if x - mes_ini <= prox - x else prox), fim
 
 
-def treino_ate(corte, meses=MESES_TREINO):
-    """JANELA DESLIZANTE com embargo: compras dos `meses` mais recentes antes de (corte - EMBARGO_DIAS) e com
-    resultado já conhecido no corte. Pedidos mais antigos que a janela ficam fora DE PROPÓSITO
-    (na versão original o treino acumulava todo o histórico desde jan/2017)."""
-    corte = pd.Timestamp(corte)
-    ini, fim = limites_janela(corte, meses)
-    m = (TS >= ini) & (TS < fim) & (bm["data_conhecimento_alvo"] < corte)
-    return bm[m]
+def meses_atipicos(df):
+    """Meses com taxa de atraso acima de FATOR_ATIPICO x a mediana mensal, medida só nos dados do próprio treino."""
+    t = df.groupby(df["order_purchase_timestamp"].dt.to_period("M"))["atrasou"].agg(["mean", "size"])
+    t = t[t["size"] >= MIN_PEDIDOS_MES]
+    return set(t.index[t["mean"] > FATOR_ATIPICO * t["mean"].median()])
+
+
+def limitar_volume(df):
+    """Cada mês entra com no máximo a mediana de pedidos por mês (amostra aleatória dentro do mês, que preserva a
+    taxa de atraso dele). Assim um mês de pico, como a Black Friday, não domina o treino."""
+    mes = df["order_purchase_timestamp"].dt.to_period("M")
+    teto = int(mes.value_counts().median())
+    ordem = pd.Series(np.random.default_rng(SEED).random(len(df)), index=df.index).groupby(mes).rank(method="first")
+    return df[ordem <= teto]
+
+
+def treino_ate(corte, estrategia=None):
+    estrategia = estrategia or ESTRATEGIA_ATIVA
+    if estrategia not in ESTRATEGIAS:
+        raise ValueError(f"estratégia desconhecida: {estrategia}")
+    df = base_conhecida(corte)
+    if estrategia == "recentes":
+        df = df[df["order_purchase_timestamp"] >= limites_janela(corte)[0]]
+    elif estrategia == "alternados":
+        m = mes_num(df["order_purchase_timestamp"])
+        df = df[(m.max() - m) % 2 == 0]
+    elif estrategia in ("sem_atipicos", "equilibrado_sem_atipicos"):
+        df = df[~df["order_purchase_timestamp"].dt.to_period("M").isin(meses_atipicos(df))]
+    if estrategia in ("volume_equilibrado", "equilibrado_sem_atipicos"):
+        df = limitar_volume(df)
+    return df
 
 
 def Xy(df):
     return df[FEATURES_X], df["atrasou"].to_numpy()
 
 
-folds = []
-for ini, fim in FOLDS_VALIDACAO:
-    tr = treino_ate(ini)
-    va = bm[(TS >= ini) & (TS < fim)]
-    folds.append({"nome": f"valida {ini[:7]} a {pd.Timestamp(fim) - pd.Timedelta(days=1):%Y-%m}",
-                  "tr": tr, "va": va, "janela": limites_janela(ini),
-                  "aval": (pd.Timestamp(ini), pd.Timestamp(fim))})
-    assert tr["atrasou"].sum() >= 50, f"fold {ini}: só {tr['atrasou'].sum()} atrasos no treino; aumente MESES_TREINO"
-
-treino_final = treino_ate(FIM_TREINO_FINAL)
-JANELA_FINAL = limites_janela(FIM_TREINO_FINAL)
-calib = bm[(TS >= FIM_TREINO_FINAL) & (TS < INICIO_TESTE) & (bm["data_conhecimento_alvo"] < INICIO_TESTE)]
-teste = bm[TS >= INICIO_TESTE]
-
-
 def periodo(ini, fim):
-    """Texto 'mmm/aa a mmm/aa' de um intervalo [ini, fim)."""
+    """Texto 'mm/aaaa a mm/aaaa' de um intervalo [ini, fim)."""
     return f"{pd.Timestamp(ini):%m/%Y} a {pd.Timestamp(fim) - pd.Timedelta(days=1):%m/%Y}"
 
 
-resumo = [{"conjunto": f["nome"], "compras_treino": periodo(*f["janela"]), "treino": len(f["tr"]),
-           "atraso_treino": f["tr"]["atrasou"].mean(), "avaliação": len(f["va"]),
-           "atraso_avaliação": f["va"]["atrasou"].mean()} for f in folds]
-resumo += [{"conjunto": f"final (calibração {periodo(FIM_TREINO_FINAL, INICIO_TESTE)})",
-            "compras_treino": periodo(*JANELA_FINAL), "treino": len(treino_final),
-            "atraso_treino": treino_final["atrasou"].mean(), "avaliação": len(calib),
-            "atraso_avaliação": calib["atrasou"].mean()},
-           {"conjunto": f"TESTE {periodo(INICIO_TESTE, pd.Timestamp(DATA_FIM) + pd.Timedelta(days=1))}",
-            "compras_treino": "-", "treino": np.nan, "atraso_treino": np.nan,
-            "avaliação": len(teste), "atraso_avaliação": teste["atrasou"].mean()}]
-print(f"Recorte: janela deslizante de {MESES_TREINO} meses | embargo {EMBARGO_DIAS} dias | "
-      f"calibração {MESES_CALIBRACAO} mês(es)")
-display(pd.DataFrame(resumo).round(4))
+def montar_recorte(estrategia, mostrar_resumo=True):
+    """Monta folds, treino final, calibração e teste para uma estratégia (variáveis globais usadas pelo resto)."""
+    global ESTRATEGIA_ATIVA, VERSAO_RECORTE, folds, treino_final, calib, teste
+    ESTRATEGIA_ATIVA = estrategia
+    VERSAO_RECORTE = f"{estrategia}_{MESES_TREINO}m" if estrategia == "recentes" else estrategia
+    folds = []
+    for ini, fim in FOLDS_VALIDACAO:
+        tr = treino_ate(ini)
+        assert tr["atrasou"].sum() >= 50, f"fold {ini}: só {tr['atrasou'].sum()} atrasos no treino"
+        folds.append({"nome": f"valida {ini[:7]} a {pd.Timestamp(fim) - pd.Timedelta(days=1):%Y-%m}",
+                      "tr": tr, "va": bm[(TS >= ini) & (TS < fim)], "aval": (pd.Timestamp(ini), pd.Timestamp(fim))})
+    treino_final = treino_ate(FIM_TREINO_FINAL)
+    calib = bm[(TS >= FIM_TREINO_FINAL) & (TS < INICIO_TESTE) & (bm["data_conhecimento_alvo"] < INICIO_TESTE)]
+    teste = bm[TS >= INICIO_TESTE]
 
-# Garantias da divisão
-assert treino_final["order_purchase_timestamp"].min() >= JANELA_FINAL[0]
-assert treino_final["order_purchase_timestamp"].max() < JANELA_FINAL[1]
-assert calib["order_purchase_timestamp"].min() >= pd.Timestamp(FIM_TREINO_FINAL)
-assert teste["order_purchase_timestamp"].min() >= pd.Timestamp(INICIO_TESTE)
-assert not set(teste["order_id"]) & (set(treino_final["order_id"]) | set(calib["order_id"]))
-assert not set(treino_final["order_id"]) & set(calib["order_id"])
+    assert treino_final["order_purchase_timestamp"].max() < pd.Timestamp(FIM_TREINO_FINAL) - pd.Timedelta(days=EMBARGO_DIAS)
+    assert calib["order_purchase_timestamp"].min() >= pd.Timestamp(FIM_TREINO_FINAL)
+    assert teste["order_purchase_timestamp"].min() >= pd.Timestamp(INICIO_TESTE)
+    assert not set(teste["order_id"]) & (set(treino_final["order_id"]) | set(calib["order_id"]))
+    assert not set(treino_final["order_id"]) & set(calib["order_id"])
+    if not mostrar_resumo:
+        return
 
-antes = bm[TS < JANELA_FINAL[0]]
-lacuna = bm[(TS >= JANELA_FINAL[0]) & (TS < INICIO_TESTE)
-            & ~bm["order_id"].isin(treino_final["order_id"]) & ~bm["order_id"].isin(calib["order_id"])]
-print(f"Fora do treino final: {len(antes):,} pedidos mais antigos que a janela (atraso {antes['atrasou'].mean():.2%}) "
-      f"e {len(lacuna):,} no embargo / com resultado ainda desconhecido (atraso {lacuna['atrasou'].mean():.2%})")
+    def desc(df):
+        t = df["order_purchase_timestamp"]
+        return f"{periodo(t.min(), t.max() + pd.Timedelta(days=1))} ({t.dt.to_period('M').nunique()} meses)"
 
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### Volume de vendas e taxa de atraso: do treino ao teste
-
-# COMMAND ----------
-
-# Gráficos do recorte: volume de vendas e taxa de atraso do período de treino até o teste.
-# Para comparar, os conjuntos da versão ORIGINAL (janela expansiva) são recalculados com as mesmas regras.
-CORTE_ORIGINAL = pd.Timestamp("2018-01-01")
-originais = {
-    "Treino original (jan-nov/17)": bm[(TS < CORTE_ORIGINAL - pd.Timedelta(days=EMBARGO_DIAS))
-                                      & (bm["data_conhecimento_alvo"] < CORTE_ORIGINAL)],
-    "Calibração original (jan-mar/18)": bm[(TS >= CORTE_ORIGINAL) & (TS < INICIO_TESTE)
-                                           & (bm["data_conhecimento_alvo"] < INICIO_TESTE)],
-}
-novos = {f"Treino novo ({periodo(*JANELA_FINAL)})": treino_final,
-         f"Calibração nova ({periodo(FIM_TREINO_FINAL, INICIO_TESTE)})": calib,
-         f"Teste ({periodo(INICIO_TESTE, pd.Timestamp(DATA_FIM) + pd.Timedelta(days=1))})": teste}
-
-# Papel de cada pedido no recorte novo
-ORDEM_PAPEIS = ["Fora da janela (mais antigo)", "Treino", "Excluído (embargo / resultado desconhecido)",
-                "Calibração", "Teste"]
-CORES_PAPEL = dict(zip(ORDEM_PAPEIS, ["#E3E3E3", "#4C72B0", "#B0B0B0", "#DD8452", "#C44E52"]))
-papel = pd.Series(ORDEM_PAPEIS[0], index=bm.index)
-papel[TS >= JANELA_FINAL[0]] = ORDEM_PAPEIS[2]
-papel[bm["order_id"].isin(treino_final["order_id"])] = "Treino"
-papel[bm["order_id"].isin(calib["order_id"])] = "Calibração"
-papel[bm["order_id"].isin(teste["order_id"])] = "Teste"
-
-meses = sorted(bm["ano_mes"].unique())
-pos_mes = {m: i for i, m in enumerate(meses)}
+    resumo = [{"conjunto": f["nome"], "compras_treino": desc(f["tr"]), "treino": len(f["tr"]),
+               "atraso_treino": f["tr"]["atrasou"].mean(), "avaliação": len(f["va"]),
+               "atraso_avaliação": f["va"]["atrasou"].mean()} for f in folds]
+    resumo += [{"conjunto": f"final (calibração {periodo(FIM_TREINO_FINAL, INICIO_TESTE)})",
+                "compras_treino": desc(treino_final), "treino": len(treino_final),
+                "atraso_treino": treino_final["atrasou"].mean(), "avaliação": len(calib),
+                "atraso_avaliação": calib["atrasou"].mean()},
+               {"conjunto": f"TESTE {periodo(INICIO_TESTE, pd.Timestamp(DATA_FIM) + pd.Timedelta(days=1))}",
+                "compras_treino": "-", "treino": np.nan, "atraso_treino": np.nan,
+                "avaliação": len(teste), "atraso_avaliação": teste["atrasou"].mean()}]
+    print(f"Recorte: '{estrategia}' = {ESTRATEGIAS[estrategia]} | embargo {EMBARGO_DIAS} dias | "
+          f"calibração {MESES_CALIBRACAO} mês(es)")
+    display(pd.DataFrame(resumo).round(4))
 
 
-def x_de(data):
-    """Posição de uma data no eixo de meses (cada mês ocupa de i-0,5 a i+0,5)."""
-    data = pd.Timestamp(data)
-    m = data.to_period("M")
-    if str(m) not in pos_mes:
-        return len(meses) - 0.5 if str(m) > meses[-1] else -0.5
-    return pos_mes[str(m)] - 0.5 + (data.day - 1) / m.days_in_month
-
-
-FAIXAS = [("Treino", *JANELA_FINAL), ("Excluído (embargo / resultado desconhecido)", JANELA_FINAL[1], FIM_TREINO_FINAL),
-          ("Calibração", FIM_TREINO_FINAL, INICIO_TESTE),
-          ("Teste", INICIO_TESTE, pd.Timestamp(DATA_FIM) + pd.Timedelta(days=1))]
-
-# ------------------------------------------------------------------ 1) Volume de vendas
-vol = pd.crosstab(bm["ano_mes"], papel).reindex(index=meses, columns=ORDEM_PAPEIS, fill_value=0)
-gmv = bm.groupby("ano_mes")["ticket_total"].sum().reindex(meses) / 1e6
-
-fig, axes = plt.subplots(1, 2, figsize=(20, 5.5), gridspec_kw={"width_ratios": [3, 1.2]})
-ax = axes[0]
-base_y = np.zeros(len(meses))
-for p_ in ORDEM_PAPEIS:
-    ax.bar(meses, vol[p_], bottom=base_y, color=CORES_PAPEL[p_], label=f"{p_} ({vol[p_].sum():,})")
-    base_y += vol[p_].to_numpy()
-ax.set_ylabel("Pedidos elegíveis")
-ax.tick_params(axis="x", rotation=70)
-ax2 = ax.twinx()
-ax2.plot(meses, gmv.values, color="black", marker="o", lw=1.5, label="Faturamento (R$ mi)")
-ax2.set_ylabel("Faturamento (R$ milhões)")
-ax2.set_ylim(0, gmv.max() * 1.25)
-ax2.grid(False)
-h1, l1 = ax.get_legend_handles_labels()
-h2, l2 = ax2.get_legend_handles_labels()
-ax.set_ylim(0, base_y.max() * 1.1)
-ax.legend(h1 + h2, l1 + l2, fontsize=8, loc="upper center", bbox_to_anchor=(0.5, -0.2), ncol=3)
-ax.set_title(f"Volume de vendas por mês e papel no recorte (treino = {MESES_TREINO} meses mais recentes)")
-
-ax = axes[1]
-conj = {**originais, **novos}
-nomes_c = list(conj)
-n_ped = [len(conj[c]) for c in nomes_c]
-n_atr = [int(conj[c]["atrasou"].sum()) for c in nomes_c]
-cores_c = ["#9DB4D8", "#F0C2A0", CORES_PAPEL["Treino"], CORES_PAPEL["Calibração"], CORES_PAPEL["Teste"]]
-ax.barh(nomes_c, n_ped, color=cores_c)
-for i, (n, a) in enumerate(zip(n_ped, n_atr)):
-    ax.annotate(f" {n:,} pedidos | {a:,} atrasos", (n, i), va="center", fontsize=8)
-ax.invert_yaxis()
-ax.set_xlim(0, max(n_ped) * 1.6)
-ax.set_title("Tamanho de cada conjunto (original x novo)")
-mostrar(fig, f"recorte_01_volume_{VERSAO_RECORTE}")
-
-# ------------------------------------------------------------------ 2) Taxa de atraso do treino ao teste
-taxa_mes = bm.groupby("ano_mes")["atrasou"].mean().reindex(meses)
-fig, ax = plt.subplots(figsize=(18, 5.5))
-for nome_f, ini, fim in FAIXAS:
-    ax.axvspan(x_de(ini), x_de(fim), color=CORES_PAPEL[nome_f], alpha=0.18, lw=0)
-    ax.annotate(nome_f.split(" (")[0], ((x_de(ini) + x_de(fim)) / 2, 0.98), xycoords=("data", "axes fraction"),
-                ha="center", va="top", fontsize=9, color=CORES_PAPEL[nome_f], fontweight="bold")
-ax.plot(range(len(meses)), taxa_mes.values, color="black", marker="o", lw=1.6, label="Taxa de atraso do mês")
-for i, v in enumerate(taxa_mes.values):
-    ax.annotate(f"{v:.1%}", (i, v), textcoords="offset points", xytext=(0, 7), ha="center", fontsize=7)
-for (nome_f, ini, fim), df_ in zip(FAIXAS, [treino_final, None, calib, teste]):
-    if df_ is not None:
-        t = df_["atrasou"].mean()
-        ax.hlines(t, x_de(ini), x_de(fim), color=CORES_PAPEL[nome_f], lw=3,
-                  label=f"Média {nome_f.lower()}: {t:.1%}")
-t_orig = originais["Treino original (jan-nov/17)"]["atrasou"].mean()
-ax.axhline(t_orig, color="#4C72B0", ls=":", lw=1.2, label=f"Média do treino ORIGINAL (jan-nov/17): {t_orig:.1%}")
-ax.set_xticks(range(len(meses)))
-ax.set_xticklabels(meses, rotation=70)
-ax.yaxis.set_major_formatter(PCT)
-ax.set_ylim(0, taxa_mes.max() * 1.3)
-ax.legend(fontsize=8, loc="upper left", bbox_to_anchor=(0, 0.9))
-ax.set_title("Taxa de atraso por mês da compra: período de treino até o teste")
-mostrar(fig, f"recorte_02_taxa_atraso_{VERSAO_RECORTE}")
-
-# ------------------------------------------------------------------ 3) Linha do tempo das janelas (folds e final)
-linhas_t = [(f["nome"], *f["janela"], *f["aval"], "Validação") for f in folds]
-linhas_t.append(("Modelo final", *JANELA_FINAL, pd.Timestamp(FIM_TREINO_FINAL), pd.Timestamp(INICIO_TESTE), "Calibração"))
-fig, ax = plt.subplots(figsize=(18, 3.2))
-for i, (nome_l, t_ini, t_fim, a_ini, a_fim, tipo) in enumerate(linhas_t):
-    ax.barh(i, x_de(t_fim) - x_de(t_ini), left=x_de(t_ini), color=CORES_PAPEL["Treino"])
-    ax.barh(i, x_de(a_ini) - x_de(t_fim), left=x_de(t_fim), color=CORES_PAPEL[ORDEM_PAPEIS[2]])
-    ax.barh(i, x_de(a_fim) - x_de(a_ini), left=x_de(a_ini), color=CORES_PAPEL["Calibração"])
-ax.barh(len(linhas_t) - 1, x_de(pd.Timestamp(DATA_FIM) + pd.Timedelta(days=1)) - x_de(INICIO_TESTE),
-        left=x_de(INICIO_TESTE), color=CORES_PAPEL["Teste"])
-ax.set_yticks(range(len(linhas_t)))
-ax.set_yticklabels([l[0] for l in linhas_t])
-ax.invert_yaxis()
-ax.set_xticks(range(len(meses)))
-ax.set_xticklabels(meses, rotation=70)
-ax.set_xlim(-0.5, len(meses) - 0.5)
-ax.legend([plt.Rectangle((0, 0), 1, 1, color=CORES_PAPEL[k]) for k in ["Treino", ORDEM_PAPEIS[2], "Calibração", "Teste"]],
-          ["Treino", "Embargo", "Validação / calibração", "Teste"], fontsize=8, loc="lower left", ncol=4)
-ax.set_title(f"Janelas deslizantes de {MESES_TREINO} meses: cada fold treina só com os meses mais recentes")
-mostrar(fig, f"recorte_03_linha_do_tempo_{VERSAO_RECORTE}")
-
-# Tabela de equilíbrio: original x novo
-equilibrio = pd.DataFrame([{"conjunto": c, "pedidos": len(df_), "atrasos": int(df_["atrasou"].sum()),
-                            "taxa_atraso": df_["atrasou"].mean(),
-                            "diferenca_para_teste_pp": (df_["atrasou"].mean() - teste["atrasou"].mean()) * 100}
-                           for c, df_ in conj.items()])
-display(equilibrio.round(4))
+# A seleção de variáveis (seção 7) usa o treino do fold 1 desta estratégia. Fica fixa em 'expansiva' para que as 30
+# variáveis sejam as mesmas da versão original: assim, a diferença nos resultados vem só do recorte.
+montar_recorte(ESTRATEGIA_SELECAO)
 
 # COMMAND ----------
 
@@ -1578,6 +1517,146 @@ print(f"{len(CANDIDATAS)} candidatas -> {N_FEATURES} selecionadas ({len(CATEGORI
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## 7b. Recorte do treino: estratégia equilibrada sem meses atípicos (vencedora da v2)
+
+# COMMAND ----------
+
+# A comparação das 6 estratégias foi feita na v2 (vencedora: equilibrado_sem_atipicos, PR-AUC 0,193 na validação).
+# Aqui o recorte é montado direto, com o treino final indo até jan/2018 (o mês mais recente disponível).
+montar_recorte(ESTRATEGIA_RECORTE)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Volume de vendas e taxa de atraso: do treino ao teste (estratégia escolhida)
+
+# COMMAND ----------
+
+# Volume de vendas e taxa de atraso do treino ao teste, para a estratégia escolhida.
+# Os conjuntos da versão ORIGINAL são recalculados com as mesmas regras, para comparar.
+CORTE_ORIGINAL = pd.Timestamp("2018-01-01")
+originais = {
+    "Treino original (jan-nov/17)": bm[(TS < CORTE_ORIGINAL - pd.Timedelta(days=EMBARGO_DIAS))
+                                      & (bm["data_conhecimento_alvo"] < CORTE_ORIGINAL)],
+    "Calibração original (jan-mar/18)": bm[(TS >= CORTE_ORIGINAL) & (TS < INICIO_TESTE)
+                                           & (bm["data_conhecimento_alvo"] < INICIO_TESTE)],
+}
+novos = {f"Treino novo ({ESTRATEGIA_ATIVA})": treino_final,
+         f"Calibração nova ({periodo(FIM_TREINO_FINAL, INICIO_TESTE)})": calib,
+         f"Teste ({periodo(INICIO_TESTE, pd.Timestamp(DATA_FIM) + pd.Timedelta(days=1))})": teste}
+
+ORDEM_PAPEIS = ["Não usado pela estratégia", "Treino", "Excluído (embargo / resultado desconhecido)",
+                "Calibração", "Teste"]
+CORES_PAPEL = dict(zip(ORDEM_PAPEIS, ["#E3E3E3", "#4C72B0", "#B0B0B0", "#DD8452", "#C44E52"]))
+papel = pd.Series(ORDEM_PAPEIS[2], index=bm.index)
+papel[bm["order_id"].isin(base_conhecida(FIM_TREINO_FINAL)["order_id"])] = ORDEM_PAPEIS[0]
+papel[bm["order_id"].isin(treino_final["order_id"])] = "Treino"
+papel[bm["order_id"].isin(calib["order_id"])] = "Calibração"
+papel[bm["order_id"].isin(teste["order_id"])] = "Teste"
+
+meses = sorted(bm["ano_mes"].unique())
+vol = pd.crosstab(bm["ano_mes"], papel).reindex(index=meses, columns=ORDEM_PAPEIS, fill_value=0)
+papel_mes = vol.idxmax(axis=1)            # papel predominante de cada mês (para sombrear o gráfico de taxa)
+
+# ------------------------------------------------------------------ 1) Volume de vendas
+gmv = bm.groupby("ano_mes")["ticket_total"].sum().reindex(meses) / 1e6
+fig, axes = plt.subplots(1, 2, figsize=(20, 5.5), gridspec_kw={"width_ratios": [3, 1.2]})
+ax = axes[0]
+base_y = np.zeros(len(meses))
+for p_ in ORDEM_PAPEIS:
+    ax.bar(meses, vol[p_], bottom=base_y, color=CORES_PAPEL[p_], label=f"{p_} ({vol[p_].sum():,})")
+    base_y += vol[p_].to_numpy()
+ax.set_ylabel("Pedidos elegíveis")
+ax.set_ylim(0, base_y.max() * 1.1)
+ax.tick_params(axis="x", rotation=70)
+ax2 = ax.twinx()
+ax2.plot(meses, gmv.values, color="black", marker="o", lw=1.5, label="Faturamento (R$ mi)")
+ax2.set_ylabel("Faturamento (R$ milhões)")
+ax2.set_ylim(0, gmv.max() * 1.25)
+ax2.grid(False)
+h1, l1 = ax.get_legend_handles_labels()
+h2, l2 = ax2.get_legend_handles_labels()
+ax.legend(h1 + h2, l1 + l2, fontsize=8, loc="upper center", bbox_to_anchor=(0.5, -0.2), ncol=3)
+ax.set_title(f"Volume de vendas por mês e papel no recorte (estratégia '{ESTRATEGIA_ATIVA}')")
+
+ax = axes[1]
+conj = {**originais, **novos}
+nomes_c = list(conj)
+n_ped = [len(conj[c]) for c in nomes_c]
+n_atr = [int(conj[c]["atrasou"].sum()) for c in nomes_c]
+ax.barh(nomes_c, n_ped, color=["#9DB4D8", "#F0C2A0", CORES_PAPEL["Treino"], CORES_PAPEL["Calibração"],
+                               CORES_PAPEL["Teste"]])
+for i, (n, a) in enumerate(zip(n_ped, n_atr)):
+    ax.annotate(f" {n:,} pedidos | {a:,} atrasos", (n, i), va="center", fontsize=8)
+ax.invert_yaxis()
+ax.set_xlim(0, max(n_ped) * 1.6)
+ax.set_title("Tamanho de cada conjunto (original x novo)")
+mostrar(fig, f"recorte_01_volume_{VERSAO_RECORTE}")
+
+# ------------------------------------------------------------------ 2) Taxa de atraso do treino ao teste
+taxa_mes = bm.groupby("ano_mes")["atrasou"].mean().reindex(meses)
+fig, ax = plt.subplots(figsize=(18, 5.5))
+for i, m in enumerate(meses):
+    ax.axvspan(i - 0.5, i + 0.5, color=CORES_PAPEL[papel_mes[m]], alpha=0.2, lw=0)
+ax.plot(range(len(meses)), taxa_mes.values, color="black", marker="o", lw=1.6, label="Taxa de atraso do mês")
+for i, v in enumerate(taxa_mes.values):
+    ax.annotate(f"{v:.1%}", (i, v), textcoords="offset points", xytext=(0, 7), ha="center", fontsize=7)
+for nome_c, df_ in [("Treino", treino_final), ("Calibração", calib), ("Teste", teste)]:
+    usados = [i for i, m in enumerate(meses) if m in set(df_["ano_mes"])]
+    t = df_["atrasou"].mean()
+    ax.hlines(t, min(usados) - 0.5, max(usados) + 0.5, color=CORES_PAPEL[nome_c], lw=3,
+              label=f"Média {nome_c.lower()}: {t:.1%}")
+t_orig = originais["Treino original (jan-nov/17)"]["atrasou"].mean()
+ax.axhline(t_orig, color="#4C72B0", ls=":", lw=1.2, label=f"Média do treino ORIGINAL (jan-nov/17): {t_orig:.1%}")
+ax.legend(handles=ax.get_legend_handles_labels()[0]
+          + [plt.Rectangle((0, 0), 1, 1, color=CORES_PAPEL[k], alpha=0.3) for k in ORDEM_PAPEIS],
+          labels=ax.get_legend_handles_labels()[1] + [f"Mês: {k.lower()}" for k in ORDEM_PAPEIS],
+          fontsize=8, loc="upper left", ncol=2)
+ax.set_xticks(range(len(meses)))
+ax.set_xticklabels(meses, rotation=70)
+ax.yaxis.set_major_formatter(PCT)
+ax.set_ylim(0, taxa_mes.max() * 1.45)
+ax.set_title(f"Taxa de atraso por mês da compra: do treino ao teste (estratégia '{ESTRATEGIA_ATIVA}')")
+mostrar(fig, f"recorte_02_taxa_atraso_{VERSAO_RECORTE}")
+
+# ------------------------------------------------------------------ 3) Meses usados por fold
+grade = []
+for f in folds:
+    grade.append((f["nome"], f["tr"], f["aval"]))
+grade.append(("Modelo final", treino_final, (pd.Timestamp(FIM_TREINO_FINAL), pd.Timestamp(INICIO_TESTE))))
+n_mes = bm.groupby("ano_mes").size().reindex(meses)
+fig, ax = plt.subplots(figsize=(18, 3.4))
+for r, (nome_l, tr, (a_ini, a_fim)) in enumerate(grade):
+    frac = (tr.groupby("ano_mes").size().reindex(meses, fill_value=0) / n_mes).fillna(0)
+    for i, m in enumerate(meses):
+        if frac[m] > 0:
+            ax.barh(r, 1, left=i - 0.5, color=CORES_PAPEL["Treino"], alpha=0.25 + 0.75 * min(frac[m], 1),
+                    edgecolor="white")
+        if a_ini.strftime("%Y-%m") <= m < a_fim.strftime("%Y-%m"):
+            ax.barh(r, 1, left=i - 0.5, color=CORES_PAPEL["Calibração"], edgecolor="white")
+        if nome_l == "Modelo final" and m >= INICIO_TESTE[:7]:
+            ax.barh(r, 1, left=i - 0.5, color=CORES_PAPEL["Teste"], edgecolor="white")
+ax.set_yticks(range(len(grade)))
+ax.set_yticklabels([g[0] for g in grade])
+ax.invert_yaxis()
+ax.set_xticks(range(len(meses)))
+ax.set_xticklabels(meses, rotation=70)
+ax.set_xlim(-0.5, len(meses) - 0.5)
+ax.legend([plt.Rectangle((0, 0), 1, 1, color=CORES_PAPEL[k]) for k in ["Treino", "Calibração", "Teste"]],
+          ["Treino (mais claro = mês usado em parte)", "Validação / calibração", "Teste"],
+          fontsize=8, loc="lower left", ncol=3)
+ax.set_title(f"Meses usados no treino de cada fold (estratégia '{ESTRATEGIA_ATIVA}')")
+mostrar(fig, f"recorte_03_linha_do_tempo_{VERSAO_RECORTE}")
+
+equilibrio = pd.DataFrame([{"conjunto": c, "pedidos": len(df_), "atrasos": int(df_["atrasou"].sum()),
+                            "taxa_atraso": df_["atrasou"].mean(),
+                            "diferenca_para_teste_pp": (df_["atrasou"].mean() - teste["atrasou"].mean()) * 100}
+                           for c, df_ in conj.items()])
+display(equilibrio.round(4))
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## 8. Busca de hiperparâmetros e balanceamento
 
 # COMMAND ----------
@@ -1611,9 +1690,59 @@ else:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 9. Treino final, calibração e avaliação no teste
+# MAGIC ## 9. Treino final, correção de prevalência, política de alerta e avaliação no teste
 
 # COMMAND ----------
+
+from scipy.optimize import brentq
+from scipy.special import expit, logit
+
+
+class CorrecaoPrevalencia:
+    """Calibração SEM mês extra: ajusta só o intercepto (no logit) para que a probabilidade média prevista no
+    treino REAL seja igual à taxa real de atraso do treino. O balanceamento infla as probabilidades; esta correção
+    desfaz a inflação sem mudar a ordem dos pedidos. Usa só o treino, então nenhum mês fica reservado
+    para calibrar e o treino pode chegar até o mês mais recente disponível."""
+    def __init__(self, base, X, y):
+        z = logit(np.clip(base.predict_proba(X)[:, 1], 1e-7, 1 - 1e-7))
+        alvo = float(np.mean(y))
+        self.deslocamento = brentq(lambda b: expit(z + b).mean() - alvo, -30, 30)
+        self.base, self.classes_, self.taxa_alvo = base, base.classes_, alvo
+
+    def predict_proba(self, X):
+        q = expit(logit(np.clip(self.base.predict_proba(X)[:, 1], 1e-7, 1 - 1e-7)) + self.deslocamento)
+        return np.column_stack([1 - q, q])
+
+
+def metricas_faixa(y, p, faixa):
+    """Sinaliza os `faixa` x 100% pedidos de maior risco e mede o resultado."""
+    alerta = p >= np.quantile(p, 1 - faixa)
+    vp = (alerta & (y == 1)).sum()
+    fp = (alerta & (y == 0)).sum()
+    rec = vp / max(y.sum(), 1)
+    esp = 1 - fp / max((y == 0).sum(), 1)
+    prec = vp / max(alerta.sum(), 1)
+    return {"faixa": faixa, "recall": rec, "acuracia": (alerta == (y == 1)).mean(), "precisao": prec,
+            "especificidade": esp, "acuracia_balanceada": (rec + esp) / 2,
+            "f1": 2 * prec * rec / max(prec + rec, 1e-12), "lift": prec / y.mean()}
+
+
+def escolher_faixa(curva, criterio=None):
+    """Escolhe a faixa de alerta na curva MÉDIA DA VALIDAÇÃO (nunca no teste)."""
+    criterio = criterio or CRITERIO_FAIXA
+    if criterio == "equilibrio":
+        i = (curva["recall"] - curva["acuracia"]).abs().idxmin()
+    elif criterio == "f1":
+        i = curva["f1"].idxmax()
+    elif criterio == "youden":
+        i = curva["acuracia_balanceada"].idxmax()
+    elif criterio == "recall_minimo":
+        ok = curva[curva["recall"] >= RECALL_MINIMO]
+        i = ok["acuracia"].idxmax() if len(ok) else curva["recall"].idxmax()
+    else:
+        raise ValueError(criterio)
+    return float(curva.loc[i, "faixa"])
+
 
 import pickle
 import cloudpickle
@@ -1638,6 +1767,8 @@ def calibrar(modelo, X, y):
 
 def modelos_base(modelo):
     """Pipelines originais (um por membro do ensemble), sem calibrador e sem wrapper de balanceamento."""
+    if isinstance(modelo, CorrecaoPrevalencia):
+        modelo = modelo.base
     if isinstance(modelo, CalibratedClassifierCV):
         est = modelo.calibrated_classifiers_[0].estimator
         modelo = getattr(est, "estimator", est)
@@ -1710,15 +1841,15 @@ Xtr, ytr = Xy(treino_final)
 Xcal, ycal = Xy(calib)
 Xte, yte = Xy(teste)
 datas_te = teste["order_purchase_timestamp"].to_numpy()
-DIR_CHECKPOINT = os.path.join(SAIDA_DIR, f"checkpoint_finais_{N_FEATURES}vars_{ASSINATURA}_bal_v30_{VERSAO_RECORTE}")
+DIR_CHECKPOINT = os.path.join(SAIDA_DIR, f"checkpoint_finais_{N_FEATURES}vars_{ASSINATURA}_bal_v30_{VERSAO_FINAL}")
 os.makedirs(DIR_CHECKPOINT, exist_ok=True)
 
-finais, res, prev, imp_nativa = {}, {}, {}, {}
+finais, res, prev, imp_nativa, curvas_val = {}, {}, {}, {}, {}
 for nome in MODELOS:
     arq = os.path.join(DIR_CHECKPOINT, f"{nome.replace(' ', '_')}.pkl")
     if os.path.exists(arq):
         with open(arq, "rb") as f:
-            res[nome], prev[nome], imp_nativa[nome] = pickle.load(f)
+            res[nome], prev[nome], imp_nativa[nome], curvas_val[nome] = pickle.load(f)
         print(f"{nome:20s} carregado do checkpoint")
         continue
     params = buscas[nome]["params"].iloc[0]
@@ -1726,7 +1857,24 @@ for nome in MODELOS:
     t0 = time.time()
     base_m = construir(nome).set_params(**params).fit(Xtr, ytr)
     t_treino = time.time() - t0
-    modelo = calibrar(base_m, Xcal, ycal) if CALIBRAR else base_m
+    if CALIBRACAO == "prevalencia":
+        modelo = CorrecaoPrevalencia(base_m, Xtr, ytr)
+    elif CALIBRACAO == "sigmoide":
+        modelo = calibrar(base_m, Xcal, ycal)
+    else:
+        modelo = base_m
+
+    # Política de alerta escolhida na VALIDAÇÃO: os mesmos parâmetros treinados em cada fold, avaliados no
+    # período seguinte. Também mede o lift na validação (diagnóstico de overfitting).
+    curvas_f, lifts_va = [], []
+    for f_ in folds:
+        Xf, yf = Xy(f_["tr"])
+        Xv, yv = Xy(f_["va"])
+        pv = construir(nome).set_params(**params).fit(Xf, yf).predict_proba(Xv)[:, 1]
+        curvas_f.append(pd.DataFrame([metricas_faixa(yv, pv, fx) for fx in FAIXAS_ALERTA]))
+        lifts_va.append(average_precision_score(yv, pv) / yv.mean())
+    curva_val = pd.concat(curvas_f).groupby("faixa", as_index=False).mean()
+    faixa = escolher_faixa(curva_val)
     t0 = time.time()
     p = modelo.predict_proba(Xte)[:, 1]
     ms_1000 = (time.time() - t0) / len(yte) * 1e6
@@ -1737,7 +1885,12 @@ for nome in MODELOS:
         "params": params,
         "pr_auc_cv": buscas[nome]["pr_auc_cv"].iloc[0],
         "brier_sem_calibracao": brier_score_loss(yte, p_sem),
-        "limiar": limiar_f1(ycal, modelo.predict_proba(Xcal)[:, 1]),
+        "faixa_alerta": faixa,
+        "limiar": float(np.quantile(p, 1 - faixa)),   # corte da faixa: usa só os scores, nunca os rótulos do teste
+        "acuracia_alerta": metricas_faixa(yte, p, faixa)["acuracia"],
+        "recall_alerta": metricas_faixa(yte, p, faixa)["recall"],
+        "lift_treino": average_precision_score(ytr, base_m.predict_proba(Xtr)[:, 1]) / ytr.mean(),
+        "lift_validacao": float(np.mean(lifts_va)),
         "segundos_treino": t_treino,
         "ms_por_1000_previsoes": ms_1000,
         "interpretabilidade": INTERPRETABILIDADE[nome],
@@ -1747,21 +1900,75 @@ for nome in MODELOS:
     except Exception as e:                         # a importância nunca deve derrubar o treino
         print(f"  importância de {nome} não calculada ({type(e).__name__}: {e})")
         imp_nome = pd.Series(dtype=float)
-    finais[nome], res[nome], prev[nome], imp_nativa[nome] = modelo, m, p, imp_nome
+    finais[nome], res[nome], prev[nome], imp_nativa[nome], curvas_val[nome] = modelo, m, p, imp_nome, curva_val
     with open(arq, "wb") as f:                     # só métricas e previsões: arquivo pequeno e rápido
-        pickle.dump((res[nome], prev[nome], imp_nativa[nome]), f)
+        pickle.dump((res[nome], prev[nome], imp_nativa[nome], curvas_val[nome]), f)
     print(f"{nome:20s} pronto em {t_treino:.0f}s")
 
 print()
 for nome, m in res.items():
     print(f"{nome:20s} TESTE PR-AUC {m['pr_auc']:.4f} (IC95 {m['pr_auc_ic95'][0]:.4f}-{m['pr_auc_ic95'][1]:.4f}) | "
           f"ROC-AUC {m['roc_auc']:.4f} | Brier {m['brier_sem_calibracao']:.4f} -> {m['brier']:.4f} | "
-          f"top10% {m['precisao_top10']:.1%}")
+          f"top10% {m['precisao_top10']:.1%} | alerta nos {m['faixa_alerta']:.0%} de maior risco: "
+          f"acurácia {m['acuracia_alerta']:.1%}, recall {m['recall_alerta']:.1%}")
 
 # Referência sem machine learning: taxa histórica de atraso da rota
 p_ref = teste["taxa_atraso_rota_hist"].fillna(ytr.mean()).to_numpy()
 ref = avaliar(yte, p_ref, datas_te)
 print(f"\nReferência (taxa da rota) PR-AUC {ref['pr_auc']:.4f} | acaso = taxa base {ref['taxa_base']:.4f}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Política de alerta: acurácia x recall por faixa, e diagnóstico de overfitting
+
+# COMMAND ----------
+
+# Política de alerta: sinalizar os X% de pedidos de maior risco. X foi escolhido na VALIDAÇÃO (média dos 3 folds),
+# pelo critério CRITERIO_FAIXA. Aqui aparece a curva inteira, na validação e no teste, para mostrar a troca entre
+# acurácia e recall. Uma faixa fixa de pedidos (em vez de um limiar de probabilidade) não se desloca quando a
+# probabilidade média muda de um período para outro: foi isso que fez a v3 e a v4 sinalizarem quase 60% dos pedidos.
+linhas_p = []
+for nome in MODELOS:
+    for f_ in FAIXAS_ALERTA:
+        val = curvas_val[nome].set_index("faixa").loc[f_]
+        te = metricas_faixa(yte, prev[nome], f_)
+        linhas_p.append({"modelo": nome, "faixa_sinalizada": f_, "recall_validacao": val["recall"],
+                         "acuracia_validacao": val["acuracia"], "recall_teste": te["recall"],
+                         "acuracia_teste": te["acuracia"], "precisao_teste": te["precisao"], "lift_teste": te["lift"],
+                         "escolhida": np.isclose(f_, res[nome]["faixa_alerta"])})
+politica = pd.DataFrame(linhas_p)
+print(f"Critério da faixa: '{CRITERIO_FAIXA}' (escolhido na validação)")
+display(politica.round(4))
+
+fig, axes = plt.subplots(1, len(MODELOS), figsize=(9 * len(MODELOS), 4.8), squeeze=False)
+for ax, nome in zip(axes[0], MODELOS):
+    d = politica[politica["modelo"] == nome]
+    ax.plot(d["faixa_sinalizada"], d["acuracia_teste"], color="#4C72B0", lw=2, marker="o", label="Acurácia (teste)")
+    ax.plot(d["faixa_sinalizada"], d["recall_teste"], color="#C44E52", lw=2, marker="o", label="Recall (teste)")
+    ax.plot(d["faixa_sinalizada"], d["acuracia_validacao"], color="#4C72B0", lw=1, ls="--", label="Acurácia (validação)")
+    ax.plot(d["faixa_sinalizada"], d["recall_validacao"], color="#C44E52", lw=1, ls="--", label="Recall (validação)")
+    ax.plot(d["faixa_sinalizada"], d["faixa_sinalizada"], color="gray", lw=1, ls=":", label="Recall do acaso")
+    ax.axvline(res[nome]["faixa_alerta"], color="black", lw=1)
+    ax.annotate(f"faixa escolhida: {res[nome]['faixa_alerta']:.0%}", (res[nome]["faixa_alerta"], 0.03),
+                rotation=90, ha="right", va="bottom", fontsize=8)
+    ax.xaxis.set_major_formatter(PCT)
+    ax.yaxis.set_major_formatter(PCT)
+    ax.set_ylim(0, 1)
+    ax.set_xlabel("% de pedidos sinalizados (maior risco primeiro)")
+    ax.set_title(f"{nome}: acurácia x recall por faixa de alerta", fontsize=10)
+    ax.legend(fontsize=8, loc="center right")
+mostrar(fig, f"politica_alerta_{VERSAO_FINAL}")
+
+# Diagnóstico de overfitting: lift (PR-AUC / taxa base) no treino real, na validação e no teste
+diag = pd.DataFrame([{"modelo": n, "lift_treino": res[n]["lift_treino"], "lift_validacao": res[n]["lift_validacao"],
+                      "lift_teste": res[n]["pr_auc"] / yte.mean()} for n in MODELOS])
+diag["queda_treino_teste_pct"] = (1 - diag["lift_teste"] / diag["lift_treino"]) * 100
+print("\nOverfitting: lift = PR-AUC / taxa base (compara conjuntos com taxas de atraso diferentes).")
+display(diag.round(3))
+for _, r_ in diag.iterrows():
+    print(f"  {r_['modelo']:20s} queda de lift treino -> teste {r_['queda_treino_teste_pct']:.0f}% "
+          f"({'ATENÇÃO' if r_['queda_treino_teste_pct'] > 50 else 'ok'})")
 
 # COMMAND ----------
 
@@ -1822,47 +2029,57 @@ print(f"\n>>> MODELO ESCOLHIDO: {vencedor}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Comparação com a versão original
+# MAGIC ### Comparação entre todas as versões (original, v1 a v5)
 
 # COMMAND ----------
 
-# Comparação com a versão ORIGINAL (janela expansiva jan-nov/2017, calibração jan-mar/2018), mesmo teste abr-ago/2018.
-# Valores da execução original (olist_atraso_pipeline_30vars_bal), copiados da saída da seção 9.
-ORIGINAL = {
-    "Regressão Logística": {"pr_auc": 0.1300, "roc_auc": 0.7077, "brier": 0.0586, "precisao_top10": 0.1633},
-    "Random Forest": {"pr_auc": 0.0976, "roc_auc": 0.6510, "brier": 0.0627, "precisao_top10": 0.1316},
-    "Gradient Boosting": {"pr_auc": 0.0997, "roc_auc": 0.6776, "brier": 0.0669, "precisao_top10": 0.1177},
-    "LightGBM": {"pr_auc": 0.1020, "roc_auc": 0.6909, "brier": 0.0600, "precisao_top10": 0.1251},
+# Comparação de TODAS as versões no mesmo teste (abr-ago/2018). Valores das versões anteriores copiados das saídas
+# de cada execução. "% sinalizados", acurácia e recall são medidos no ponto de alerta de cada versão.
+VERSOES = {
+    "original": {"Regressão Logística": dict(pr_auc=0.1301, brier=0.0587, precisao_top10=0.163, acuracia=0.699, recall=0.596, sinalizados=0.311),
+                 "Gradient Boosting": dict(pr_auc=0.0995, brier=0.0669, precisao_top10=0.118, acuracia=0.541, recall=0.723, sinalizados=0.483)},
+    "v1 (5 meses)": {"Regressão Logística": dict(pr_auc=0.1091, brier=0.0580, precisao_top10=0.132, acuracia=0.801, recall=0.400, sinalizados=0.188),
+                     "Gradient Boosting": dict(pr_auc=0.0977, brier=0.0644, precisao_top10=0.120, acuracia=0.705, recall=0.517, sinalizados=0.297)},
+    "v2 (equilibrado)": {"Regressão Logística": dict(pr_auc=0.1307, brier=0.0653, precisao_top10=0.161, acuracia=0.708, recall=0.594, sinalizados=0.302),
+                         "Gradient Boosting": dict(pr_auc=0.1182, brier=0.0632, precisao_top10=0.137, acuracia=0.750, recall=0.480, sinalizados=0.248)},
+    "v3 (calib. jan/18)": {"Regressão Logística": dict(pr_auc=0.0999, brier=0.0690, precisao_top10=0.116, acuracia=0.432, recall=0.832, sinalizados=0.603),
+                           "Gradient Boosting": dict(pr_auc=0.1057, brier=0.0578, precisao_top10=0.122, acuracia=0.554, recall=0.759, sinalizados=0.474)},
+    "v4 (oversampling)": {"Regressão Logística": dict(pr_auc=0.1033, brier=0.0604, precisao_top10=0.122, acuracia=0.465, recall=0.817, sinalizados=0.569),
+                          "Gradient Boosting": dict(pr_auc=0.1050, brier=0.0587, precisao_top10=0.122, acuracia=0.437, recall=0.849, sinalizados=0.600)},
 }
-METRICAS_COMP = {"pr_auc": "PR-AUC (maior = melhor)", "roc_auc": "ROC-AUC (maior = melhor)",
-                 "brier": "Brier calibrado (menor = melhor)", "precisao_top10": "Precisão top 10% (maior = melhor)"}
-linhas_c = []
-for nome in MODELOS:
-    for met, rotulo in METRICAS_COMP.items():
-        o, n = ORIGINAL[nome][met], float(res[nome][met])
-        melhorou = n < o if met == "brier" else n > o
-        linhas_c.append({"modelo": nome, "métrica": rotulo, "original": o, f"novo ({VERSAO_RECORTE})": n,
-                         "diferença": n - o, "melhorou": melhorou})
-comp_versoes = pd.DataFrame(linhas_c)
+VERSOES["v5 (esta)"] = {m: dict(pr_auc=float(res[m]["pr_auc"]), brier=float(res[m]["brier"]),
+                                precisao_top10=float(res[m]["precisao_top10"]), acuracia=float(res[m]["acuracia_alerta"]),
+                                recall=float(res[m]["recall_alerta"]), sinalizados=float(res[m]["faixa_alerta"]))
+                        for m in MODELOS}
+for v in VERSOES:
+    for m in MODELOS:
+        d = VERSOES[v][m]
+        d["lift_alerta"] = d["recall"] / d["sinalizados"]
+METRICAS_COMP = {"pr_auc": "PR-AUC", "precisao_top10": "Precisão top 10%", "brier": "Brier (menor = melhor)",
+                 "lift_alerta": "Lift no ponto de alerta", "acuracia": "Acurácia no alerta", "recall": "Recall no alerta"}
+comp_versoes = pd.DataFrame([{"modelo": m, "métrica": rot, **{v: VERSOES[v][m][met] for v in VERSOES}}
+                             for m in MODELOS for met, rot in METRICAS_COMP.items()])
 brier_constante = yte.mean() * (1 - yte.mean())
-print(f"Referência de Brier: prever sempre a taxa base do teste ({yte.mean():.2%}) dá Brier {brier_constante:.4f}. "
-      f"Um modelo calibrado deveria ficar ABAIXO disso.")
+print(f"Brier de prever sempre a taxa base ({yte.mean():.2%}): {brier_constante:.4f} (o ideal é ficar abaixo)")
 display(comp_versoes.round(4))
 
-fig, axes = plt.subplots(1, len(METRICAS_COMP), figsize=(18, 4))
-for ax, (met, rotulo) in zip(axes, METRICAS_COMP.items()):
+cores_v = sns.color_palette("Blues", len(VERSOES))
+fig, axes = plt.subplots(2, 3, figsize=(21, 8.5))
+for ax, (met, rotulo) in zip(axes.ravel(), METRICAS_COMP.items()):
     x = np.arange(len(MODELOS))
-    ax.bar(x - 0.2, [ORIGINAL[m][met] for m in MODELOS], 0.4, label="Original (expansiva)", color="#9DB4D8")
-    ax.bar(x + 0.2, [float(res[m][met]) for m in MODELOS], 0.4, label=f"Nova ({MESES_TREINO} meses)", color="#4C72B0")
+    larg = 0.8 / len(VERSOES)
+    for k, (v, cor) in enumerate(zip(VERSOES, cores_v)):
+        ax.bar(x + (k - (len(VERSOES) - 1) / 2) * larg, [VERSOES[v][m][met] for m in MODELOS], larg, color=cor,
+               label=v, edgecolor="black" if v.startswith("v5") else "none")
     if met == "brier":
         ax.axhline(brier_constante, color="red", ls=":", lw=1.2, label="Prever sempre a taxa base")
-    if met == "pr_auc":
-        ax.axhline(yte.mean(), color="red", ls=":", lw=1.2, label="Acaso")
+    if met in ("acuracia", "recall", "precisao_top10"):
+        ax.yaxis.set_major_formatter(PCT)
     ax.set_xticks(x)
-    ax.set_xticklabels(MODELOS, fontsize=8)
+    ax.set_xticklabels(MODELOS, fontsize=9)
     ax.set_title(rotulo, fontsize=10)
-axes[0].legend(fontsize=7)
-mostrar(fig, f"comparacao_versoes_{VERSAO_RECORTE}")
+axes[0, 0].legend(fontsize=7, ncol=2)
+mostrar(fig, f"comparacao_versoes_{VERSAO_FINAL}")
 
 # COMMAND ----------
 
@@ -1894,7 +2111,7 @@ print(f"Spearman entre peso e importância: {stats.spearmanr(comp.iloc[:, 0], co
 # COMMAND ----------
 
 # Matrizes de confusão: os modelos testados no TESTE (abr-ago/2018), em dois pontos de corte
-#  1) Limiar F1: escolhido na calibração (período de calibração), nunca no teste
+#  1) Faixa de alerta (X% de maior risco), X escolhido na validação, nunca no teste
 #  2) Top 10% de maior risco: a "faixa vermelha" usada na matriz de decisão
 # Usa prev, res, yte e MODELOS das células anteriores (rode a seção de treino final antes).
 
@@ -1910,7 +2127,7 @@ def metricas_corte(y, pred):
 
 
 CORTES = {
-    "Limiar F1 (calibração)": lambda nome, p: (p >= res[nome]["limiar"]).astype(int),
+    "Alerta: faixa escolhida na validação": lambda nome, p: (p >= res[nome]["limiar"]).astype(int),
     "Top 10% de risco": lambda nome, p: (p >= np.quantile(p, 0.9)).astype(int),
 }
 
@@ -1980,7 +2197,7 @@ for nome in MODELOS:
 pr_r, rc_r, _ = precision_recall_curve(yte, p_ref)
 ax.plot(rc_r, pr_r, color="gray", ls="--", lw=1.2, label=f"Referência: taxa da rota ({ref['pr_auc']:.3f})")
 ax.axhline(base_te, color="red", ls=":", lw=1.5, label=f"Acaso = taxa base ({base_te:.3f})")
-ax.scatter([], [], marker="o", color="white", edgecolor="black", label="Limiar F1 (calibração)")
+ax.scatter([], [], marker="o", color="white", edgecolor="black", label="Faixa de alerta (validação)")
 ax.scatter([], [], marker="s", color="white", edgecolor="black", label="Top 10% de risco")
 ax.set(xlabel="Recall (atrasos capturados)", ylabel="Precisão (alertas corretos)",
        title="Curva Precision-Recall | teste abr-ago/2018", xlim=(0, 1), ylim=(0, 0.5))

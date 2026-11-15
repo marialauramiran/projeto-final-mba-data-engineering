@@ -1,10 +1,15 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "6"
+# ///
 # MAGIC %md
 # MAGIC # 06 · Exportar a Gold para o app Streamlit
 # MAGIC Gera `gold.agg_mercado` e `gold.ref_rotas` no contrato que o app espera
 # MAGIC e exporta em Parquet. Ajuste os nomes de colunas de `gold.pedidos` ao seu schema.
 
 # COMMAND ----------
+
 from pyspark.sql import functions as F, Window
 
 CAT = "raio_x"  # catálogo do Unity Catalog
@@ -15,6 +20,7 @@ p = (spark.table(f"{CAT}.gold.pedidos")
      .where(F.col("order_purchase_timestamp").between("2017-01-01", "2018-08-31 23:59:59")))
 
 # COMMAND ----------
+
 # gold.agg_mercado : categoria x UF de destino
 cat_w = Window.partitionBy("categoria")
 queixa = (p.where("review_score <= 2").groupBy("categoria", "queixa_tema").count()
@@ -41,6 +47,7 @@ agg = (p.groupBy(F.col("product_category_name_english").alias("categoria"),
        .fillna({"queixa_top": "Não recebi", "pedidos_jan_ago_2017": 0, "pedidos_jan_ago_2018": 0}))
 
 # COMMAND ----------
+
 # gold.ref_rotas : UF origem x UF destino (frete ~ base + R$/kg, via regressão simples por rota)
 rot = (p.groupBy(F.col("seller_state").alias("uf_origem"), F.col("customer_state").alias("uf_destino"))
        .agg(F.countDistinct("order_id").alias("pedidos"),
@@ -51,6 +58,7 @@ rot = (p.groupBy(F.col("seller_state").alias("uf_origem"), F.col("customer_state
        .where("pedidos >= 30"))  # rotas com pouco histórico ficam de fora
 
 # COMMAND ----------
+
 for nome, df in {"agg_mercado": agg, "ref_rotas": rot}.items():
     df.write.mode("overwrite").saveAsTable(f"{CAT}.gold.{nome}")
     df.toPandas().to_parquet(f"{SAIDA}/{nome}.parquet", index=False)

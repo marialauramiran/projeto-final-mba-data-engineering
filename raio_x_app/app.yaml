@@ -4,3 +4,6 @@ env:
     value: "/Volumes/workspace/olist_gold/parquet"
   - name: RAIOX_PRED_PATH
     value: "/Volumes/workspace/olist_gold/ml_predictions"
+  # Nome do endpoint de Model Serving que expõe o modelo de risco de atraso (preencha!)
+  - name: RAIOX_MODEL_ENDPOINT
+    value: ""

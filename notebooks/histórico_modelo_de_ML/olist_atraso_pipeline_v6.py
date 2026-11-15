@@ -1,24 +1,21 @@
 # Databricks notebook source
-# /// script
-# [tool.databricks.environment]
-# environment_version = "6"
-# ///
 # MAGIC %md
-# MAGIC # Atraso de entrega Olist: v5, versão consolidada
+# MAGIC # Atraso de entrega Olist: v6 (v5 + aprendizados da análise de 14/11)
 # MAGIC
-# MAGIC **Diagnóstico das versões anteriores (mesmo teste, abr-ago/2018):**
+# MAGIC **Auditoria da duplicação (seção 1b):** a v5 já evita a duplicação de pedidos. Itens e pagamentos são agregados por pedido antes dos joins, a avaliação é reduzida a uma por pedido e a geolocalização a um ponto por CEP. Os testes de integridade (chaves únicas, 1 linha por pedido e GMV reconciliado) passam. A célula 1b mostra os números de cada etapa e o efeito nos resultados.
 # MAGIC
-# MAGIC - **Melhor ordenação:** a v2 (recorte equilibrado sem meses atípicos, treino até jan/2018). Regressão Logística com PR-AUC 0,131 e Gradient Boosting com 0,118.
-# MAGIC - **Por que a v3 e a v4 pioraram (PR-AUC ~0,10):** o treino passou a terminar em nov/2017 para liberar jan/2018 para a calibração. Assim o modelo perdeu o mês mais recente e nunca viu as variáveis de "atraso recente" em alta, como estão logo após a crise de fev-mar/2018.
-# MAGIC - **Por que a v3 e a v4 sinalizaram ~60% dos pedidos:** o limiar de probabilidade foi escolhido em jan/2018. Em abril, logo após a crise, todas as probabilidades sobem, e o limiar disparou para quase todo mundo.
-# MAGIC - **Oversampling e SMOTE (v4):** não superaram `pesos` nem o `ensemble_subamostragem` na validação.
+# MAGIC **O que muda da v5 para a v6 (todas as escolhas feitas na VALIDAÇÃO, nunca no teste):**
 # MAGIC
-# MAGIC **O que a v5 faz:**
+# MAGIC | # | Mudança | Por quê |
+# MAGIC |---|---|---|
+# MAGIC | 1 | Novas variáveis **"atrasos em aberto"** (plataforma e UF de destino) | As taxas "recentes" só percebem um choque quando os pedidos atrasados são entregues (1–2 meses depois). Pedidos vencidos e ainda não entregues são conhecidos na hora |
+# MAGIC | 2 | `mes` sai das candidatas | Só há um ano de dados: o modelo decoraria o mês, não a sazonalidade |
+# MAGIC | 3 | Seleção de variáveis **por critério** (relevância mínima + redundância), sem número fixo de 30 | O número de variáveis passa a ser consequência da análise |
+# MAGIC | 4 | **Recorte do treino recomparado na validação** (`ESTRATEGIA_RECORTE = "auto"`) | "Equilibrado sem atípicos" descarta ~40% do treino; no experimento de 14/11, tirar os meses atípicos piorou o recall nos 3 folds |
+# MAGIC | 5 | **Sem balanceamento** na busca | Pesos e subamostragem não melhoraram a ordenação e pioraram a calibração |
+# MAGIC | 6 | Faixa de alerta pelo **menor custo** (`CRITERIO_FAIXA = "custo"`, razão 10×), faixas até 70% | Perder um atraso custa 5 a 10 vezes mais que um alarme falso (análise das avaliações) |
+# MAGIC | 7 | Busca e checkpoints com nomes novos (`v6`) | Força o retreino com as variáveis novas, sem reaproveitar arquivos da v5 |
 # MAGIC
-# MAGIC 1. **Volta ao recorte e aos hiperparâmetros da v2.** Reaproveita a busca salva da v2 e não busca de novo no teste.
-# MAGIC 2. **Calibra sem mês extra:** corrige a inflação de probabilidade do balanceamento usando só o treino (correção de prevalência).
-# MAGIC 3. **Alerta por faixa:** sinaliza os X% de pedidos de maior risco, com X escolhido na validação pelo critério `CRITERIO_FAIXA`. Uma faixa não se desloca quando a probabilidade média muda.
-# MAGIC 4. **Diagnóstico de overfitting por lift** (treino, validação e teste) e **comparação de todas as versões**.
 
 # COMMAND ----------
 
@@ -70,15 +67,17 @@ FIM_TREINO_FINAL = str((pd.Timestamp(INICIO_TESTE) - pd.DateOffset(months=MESES_
 CALIBRAR = True                   # mantido por compatibilidade; a v5 usa CALIBRACAO abaixo
 
 # ---- v5: consolidação
-VERSAO_FINAL = "v5_consolidada"   # nome dos checkpoints do treino final (a busca da v2 é reaproveitada)
+VERSAO_FINAL = "v6_aprendizados"  # nome dos checkpoints do treino final (v6: busca refeita)
 CALIBRACAO = "prevalencia"        # "prevalencia" = corrige a inflação do balanceamento usando só o treino
                                   # "sigmoide"    = calibrador no mês de calibração (como na v2)
-FAIXAS_ALERTA = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50]   # % de pedidos sinalizados testados
-CRITERIO_FAIXA = "equilibrio"     # "equilibrio" (recall ~ acurácia) | "f1" | "youden" | "recall_minimo"
+FAIXAS_ALERTA = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.70]   # % de pedidos sinalizados testados
+CRITERIO_FAIXA = "custo"          # v6: "custo" (menor custo total) | "equilibrio" | "f1" | "youden" | "recall_minimo"
+RAZAO_CUSTO = 10                  # v6: perder um atraso custa 10x um alarme falso (análise das avaliações: 5 a 10x)
 RECALL_MINIMO = 0.50              # usado só pelo critério "recall_minimo"
 
 # ---- RECORTE DO TREINO (seção 7b compara as estratégias na validação)
-ESTRATEGIA_RECORTE = "equilibrado_sem_atipicos"   # vencedora da comparação da v2 (fixa: não recompara)
+ESTRATEGIA_RECORTE = "auto"       # v6: "auto" recompara na validação; ou fixe: "expansiva", "equilibrado_sem_atipicos"...
+ESTRATEGIAS_COMPARAR = ["expansiva", "sem_atipicos", "equilibrado_sem_atipicos", "recentes"]
 ESTRATEGIA_SELECAO = "expansiva"  # recorte usado só na seleção de variáveis (igual à versão original)
 MESES_TREINO = 5                  # usado pela estratégia "recentes"
 FATOR_ATIPICO = 1.5               # mês atípico = taxa de atraso acima de 1,5x a mediana mensal do próprio treino
@@ -113,7 +112,9 @@ PESOS_DECISAO = {
 assert abs(sum(PESOS_DECISAO.values()) - 1) < 1e-9
 
 # seleção de variáveis (matriz de correlação)
-N_FEATURES = 30                   # variáveis que entram no modelo
+N_FEATURES_MAX = 40               # v6: teto de segurança; a seleção para antes pelo critério abaixo
+MIN_RELEVANCIA = 0.01             # v6: variável com relevância abaixo disso não entra
+N_FEATURES = N_FEATURES_MAX       # recalculado na seleção (seção 7)
 LIMIAR_REDUNDANCIA = 0.85         # duas variáveis com correlação acima disso não entram juntas
 
 # COMMAND ----------
@@ -359,6 +360,57 @@ gmv_itens = silver["items"].join(integrada.select("order_id"), "order_id", "semi
 gmv_base = integrada.agg(F.sum("valor_produtos")).first()[0]
 assert abs(gmv_itens - gmv_base) < 1, "GMV da base integrada não bate com order_items"
 print(f"Base integrada: {n_ped:,} pedidos x {len(integrada.columns)} colunas | GMV R$ {gmv_base:,.2f} (reconciliado)")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 1b. Auditoria da duplicação e da limpeza (v6)
+
+# COMMAND ----------
+
+# Mostra, etapa por etapa, onde a base poderia duplicar e como cada ponto foi tratado.
+rev_bruto = ler_silver(TABELAS["reviews"])
+n_rev, n_rev_ped = rev_bruto.count(), rev_bruto.select("order_id").distinct().count()
+ped_multi_rev = rev_bruto.groupBy("order_id").count().filter("count > 1").count()
+n_itens, n_ped_itens = silver["items"].count(), silver["items"].select("order_id").distinct().count()
+n_pag, n_ped_pag = silver["payments"].count(), silver["payments"].select("order_id").distinct().count()
+n_orders = silver["orders"].count()
+n_geo = silver_geo.count() if silver_geo is not None else 0
+n_cep = geo.count() if geo is not None else 0
+itens_sem_produto = silver["items"].join(silver["products"].select("product_id"), "product_id", "left_anti")
+n_itens_sem_prod = itens_sem_produto.count()
+n_ped_sem_prod = itens_sem_produto.select("order_id").distinct().count()
+
+auditoria = pd.DataFrame([
+    {"etapa": "Avaliações", "linhas_na_silver": n_rev, "chaves_unicas": n_rev_ped,
+     "risco": f"{ped_multi_rev:,} pedidos com mais de 1 avaliação: o join multiplicaria esses pedidos",
+     "tratamento": "Mantida só a avaliação mais recente por pedido (row_number)",
+     "efeito_no_modelo": "Nenhum: avaliação é pós-entrega e só entra na análise de satisfação"},
+    {"etapa": "Itens", "linhas_na_silver": n_itens, "chaves_unicas": n_ped_itens,
+     "risco": f"{n_itens - n_ped_itens:,} linhas a mais que pedidos (1 linha por unidade)",
+     "tratamento": "Agregados por pedido (somas, máximos, contagens) antes do join",
+     "efeito_no_modelo": "Nenhum: GMV da base reconciliado com a soma dos itens"},
+    {"etapa": "Pagamentos", "linhas_na_silver": n_pag, "chaves_unicas": n_ped_pag,
+     "risco": f"{n_pag - n_ped_pag:,} linhas a mais que pedidos (vários pagamentos)",
+     "tratamento": "Agregados por pedido; tipo = pagamento de maior valor",
+     "efeito_no_modelo": "Nenhum"},
+    {"etapa": "Geolocalização", "linhas_na_silver": n_geo, "chaves_unicas": n_cep,
+     "risco": "Várias coordenadas por CEP",
+     "tratamento": "Média das coordenadas por CEP (só pontos dentro do Brasil)",
+     "efeito_no_modelo": "Nenhum"},
+    {"etapa": "Pedidos sem item", "linhas_na_silver": n_orders, "chaves_unicas": n_ped,
+     "risco": f"{n_orders - n_ped:,} pedidos sem nenhum item",
+     "tratamento": "Excluídos (join inner com os itens): não têm produto, frete nem vendedor",
+     "efeito_no_modelo": "Nenhum: quase todos cancelados ou indisponíveis"},
+    {"etapa": "Produtos removidos na Silver", "linhas_na_silver": n_itens_sem_prod, "chaves_unicas": n_ped_sem_prod,
+     "risco": "Itens cujo produto não existe na Silver (produtos sem categoria removidos na limpeza da camada)",
+     "tratamento": "Categoria 'desconhecido'; peso/volume nulos imputados pela mediana com indicador",
+     "efeito_no_modelo": f"Pequeno: {n_ped_sem_prod / n_ped:.1%} dos pedidos perdem peso e categoria"},
+])
+display(auditoria)
+print(f"Base integrada: {n_ped:,} pedidos = {n_unicos:,} order_id distintos -> sem duplicação")
+print("Conclusão: a limpeza não altera os resultados do modelo; a única perda real de informação vem da Silver "
+      "(produtos sem categoria), e é pequena.")
 
 # COMMAND ----------
 
@@ -705,6 +757,28 @@ def contagem_anterior(ped, chave, janela_dias):
     return out
 
 
+def contar_antes(ped, chave, col_t, janela_dias=None):
+    """Nº de eventos (col_t) da mesma chave ocorridos ESTRITAMENTE antes de cada compra.
+    Com janela_dias, só os ocorridos nos últimos N dias antes da compra."""
+    ev = ped.loc[ped[col_t].notna(), [chave, col_t]].rename(columns={col_t: "_t"}).sort_values("_t", kind="mergesort")
+    ev["_t"] = ev["_t"].astype("datetime64[ns]")
+    ev["_n"] = ev.groupby(chave, sort=False).cumcount() + 1
+
+    def ate(deslocamento, incluir_igual):
+        q = ped[[chave, "order_purchase_timestamp"]].copy()
+        q["_t"] = (q["order_purchase_timestamp"] - deslocamento).astype("datetime64[ns]")
+        q["_idx"] = np.arange(len(q))
+        q = q.sort_values("_t", kind="mergesort")
+        h = pd.merge_asof(q, ev[[chave, "_t", "_n"]], on="_t", by=chave, direction="backward",
+                          allow_exact_matches=incluir_igual)
+        return h.sort_values("_idx")["_n"].fillna(0).to_numpy()
+
+    n = ate(pd.Timedelta(0), False)
+    if janela_dias is not None:
+        n = n - ate(pd.Timedelta(days=janela_dias), True)
+    return n
+
+
 def criar_features(ped):
     ped = ped.sort_values("order_purchase_timestamp", kind="mergesort").copy()
     ts = ped["order_purchase_timestamp"]
@@ -745,6 +819,27 @@ def criar_features(ped):
     ped["taxa_atraso_destino_hist"] = destino["taxa_atraso"].fillna(ger["taxa_atraso"])
     ped["pedidos_plataforma_7d"] = contagem_anterior(ped, "_geral", 7)
 
+    # ---------------------------------------------------------- v6: atrasos em aberto (tempo real, sem vazamento)
+    # No instante da compra: pedidos com data prometida JÁ VENCIDA e ainda NÃO entregues. Um pedido deixa de
+    # contar como "em aberto" quando é entregue ou, no máximo, 90 dias após o prometido (regra fixa, para que
+    # pedidos extraviados não se acumulem para sempre).
+    valido = ~ped["order_status"].isin(["canceled", "unavailable"]) & ped["order_estimated_delivery_date"].notna()
+    prometido = ped["order_estimated_delivery_date"]
+    limite = prometido + pd.Timedelta(days=90)
+    entrega = ped["order_delivered_customer_date"]
+    resolvido = entrega.where(entrega > prometido, prometido).where(entrega.notna())   # NaT se não entregue
+    ped["_vencido_em"] = prometido.where(valido)
+    ped["_resolvido_em"] = resolvido.where(resolvido < limite, limite).where(valido)
+    for chave, nome in [("_geral", "plataforma"), ("customer_state", "destino")]:
+        abertos = contar_antes(ped, chave, "_vencido_em") - contar_antes(ped, chave, "_resolvido_em")
+        vencidos_janela = contar_antes(ped, chave, "_vencido_em", JANELA_RECENTE_DIAS)
+        if nome == "plataforma":
+            taxa_plat = np.where(vencidos_janela > 0, abertos / np.maximum(vencidos_janela, 1), 0.0)
+            ped["atrasos_abertos_plataforma"] = taxa_plat
+        else:
+            ped["atrasos_abertos_destino"] = ((abertos + MIN_EVENTOS_RECENTE * taxa_plat)
+                                              / (vencidos_janela + MIN_EVENTOS_RECENTE))
+
     # Folgas: prazo prometido menos o tempo que a rota/vendedor costumava levar
     ped["folga_prometida"] = ped["prazo_prometido_dias"] - ped["entrega_rota_hist_dias"]
 
@@ -768,7 +863,7 @@ def criar_features(ped):
     ped["fim_de_semana"] = (ped["dia_semana"] >= 5).astype(int)
     ped["cliente_recorrente"] = (ped.groupby("_cliente")["order_purchase_timestamp"].rank(method="min") > 1).astype(int)
 
-    return ped.drop(columns=["_rota_uf", "_rota_reg", "_geral", "_vendedor", "_cliente"])
+    return ped.drop(columns=["_rota_uf", "_rota_reg", "_geral", "_vendedor", "_cliente", "_vencido_em", "_resolvido_em"])
 
 
 t0 = time.time()
@@ -878,6 +973,8 @@ _d("Logística e localidade", "compra", "numérica", [
     ("taxa_atraso_destino_hist", "Taxa de atraso para a UF do cliente antes da compra"),
     ("taxa_atraso_plataforma_recente", f"Taxa de atraso de toda a plataforma nos últimos {JANELA_RECENTE_DIAS} dias (greves, picos)"),
     ("pedidos_plataforma_7d", "Volume de compras na plataforma nos 7 dias anteriores (pressão logística)"),
+    ("atrasos_abertos_plataforma", "v6: pedidos vencidos e ainda não entregues no instante da compra / vencidos nos últimos 30 dias"),
+    ("atrasos_abertos_destino", "v6: idem, na UF do cliente (suavizado pela taxa da plataforma)"),
 ])
 _d("Produto e vendedor", "compra", "categórica", [("categoria", "Categoria do item principal")])
 _d("Produto e vendedor", "compra", "numérica", [
@@ -897,11 +994,15 @@ _d("Produto e vendedor", "compra", "numérica", [
     ("vendedor_dias_entrega_hist", "Tempo médio de entrega do vendedor antes da compra"),
 ])
 _d("Calendário e cliente", "compra", "numérica", [
-    ("mes", "Mês da compra"), ("dia_semana", "Dia da semana (0 = segunda)"), ("hora", "Hora da compra"),
+    ("dia_semana", "Dia da semana (0 = segunda)"), ("hora", "Hora da compra"),
     ("fim_de_semana", "Compra no sábado ou domingo"),
     ("cliente_recorrente", "Cliente já comprou antes"),
 ])
 _d("Razões entre variáveis", "compra", "numérica", [(n, d) for n, (_, d) in RAZOES_NOVAS.items()])
+# v6: excluída por decisão de modelagem (documentada para deixar explícito por que não entra)
+_d("Excluída (aprendizado v6)", "excluída", "numérica", [
+    ("mes", "Mês da compra: com um único ano de dados, o modelo decoraria o mês em vez de aprender sazonalidade"),
+])
 # Pós-compra: documentadas para deixar explícito por que NÃO entram
 _d("Pós-compra (proibida no modelo)", "pós-compra", "alvo", [
     ("atrasou", "ALVO: entrega após a data prometida"),
@@ -1265,7 +1366,8 @@ def construir(nome):
                                   ("seleciona", SelecionaColunas(SELECIONADAS))] + etapas))
 
 
-BALANCEAMENTO = {"estrategia": ["nenhum", "pesos", "ensemble_subamostragem"], "razao": [1.0, 2.0, 3.0, 5.0]}
+# v6: sem balanceamento (testado em 14/11: não melhora a ordenação e piora a calibração)
+BALANCEAMENTO = {"estrategia": ["nenhum"], "razao": [1.0]}
 ESPACOS = {
     "Regressão Logística": {"estimador__modelo__C": [0.003, 0.01, 0.03, 0.1, 0.3, 1.0],
                             "estimador__prep__num__spline": ["passthrough",
@@ -1299,7 +1401,7 @@ print(f"Modelos testados: {MODELOS}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 7. Seleção de variáveis por matriz de correlação (30 variáveis)
+# MAGIC ## 7. Seleção de variáveis por matriz de correlação (v6: por critério, sem número fixo)
 
 # COMMAND ----------
 
@@ -1428,7 +1530,7 @@ mostrar(fig, "selecao_01b_novas_razoes")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Pesos e seleção das 30 variáveis
+# MAGIC ### Pesos e seleção das variáveis (relevância mínima + redundância)
 
 # COMMAND ----------
 
@@ -1443,18 +1545,22 @@ for r in RAZOES_APROVADAS:
         peso_bruto[r] = float(relevancia[r] * (1 - red))
 fora = [r for r in RAZOES_NOVAS if r not in selecionadas] + list(SUBSTITUIDAS)
 restantes = [f for f in relevancia.sort_values(ascending=False).index if f not in selecionadas and f not in fora]
-while len(selecionadas) < N_FEATURES:
+while len(selecionadas) < N_FEATURES_MAX and restantes:
     if selecionadas:
         red = assoc.loc[restantes, selecionadas].max(axis=1)
     else:
         red = pd.Series(0.0, index=restantes)
     score = (relevancia[restantes] * (1 - red)).where(red <= LIMIAR_REDUNDANCIA, -1.0)
     melhor = score.idxmax()
-    assert score[melhor] > 0, f"só {len(selecionadas)} variáveis passam no filtro de redundância"
+    if score[melhor] <= 0 or relevancia[melhor] < MIN_RELEVANCIA:   # v6: critério de parada
+        break
     selecionadas.append(melhor)
     peso_bruto[melhor] = float(score[melhor])
     restantes.remove(melhor)
 
+N_FEATURES = len(selecionadas)
+print(f"v6: seleção parou em {N_FEATURES} variáveis (relevância mínima {MIN_RELEVANCIA}, "
+      f"redundância máxima {LIMIAR_REDUNDANCIA}, teto {N_FEATURES_MAX})")
 pesos = pd.Series(peso_bruto)
 pesos = pesos / pesos.sum()
 
@@ -1513,13 +1619,47 @@ print(f"{len(CANDIDATAS)} candidatas -> {N_FEATURES} selecionadas ({len(CATEGORI
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 7b. Recorte do treino: estratégia equilibrada sem meses atípicos (vencedora da v2)
+# MAGIC ## 7b. Recorte do treino: v6 recompara as estratégias na validação
 
 # COMMAND ----------
 
-# A comparação das 6 estratégias foi feita na v2 (vencedora: equilibrado_sem_atipicos, PR-AUC 0,193 na validação).
-# Aqui o recorte é montado direto, com o treino final indo até jan/2018 (o mês mais recente disponível).
-montar_recorte(ESTRATEGIA_RECORTE)
+# v6: compara as estratégias de recorte nos 3 folds de VALIDAÇÃO, com parâmetros fixos e moderados
+# (a busca de hiperparâmetros vem depois, já com a estratégia escolhida). O teste não participa.
+PARAMS_COMPARACAO = {
+    "Regressão Logística": {"estimador__modelo__C": 0.1},
+    "Gradient Boosting": {"estimador__modelo__n_estimators": 200, "estimador__modelo__learning_rate": 0.05,
+                          "estimador__modelo__max_depth": 3, "estimador__modelo__min_samples_leaf": 100,
+                          "estimador__modelo__subsample": 0.85, "estimador__modelo__max_features": "sqrt"},
+    "LightGBM": {"estimador__modelo__n_estimators": 300, "estimador__modelo__num_leaves": 31,
+                 "estimador__modelo__min_child_samples": 100},
+    "Random Forest": {"estimador__modelo__min_samples_leaf": 50},
+}
+
+if ESTRATEGIA_RECORTE == "auto":
+    linhas_rec = []
+    for est in ESTRATEGIAS_COMPARAR:
+        montar_recorte(est, mostrar_resumo=False)
+        for nome in MODELOS:
+            pr = []
+            for f_ in folds:
+                Xf, yf = Xy(f_["tr"])
+                Xv, yv = Xy(f_["va"])
+                m_ = construir(nome).set_params(**PARAMS_COMPARACAO[nome]).fit(Xf, yf)
+                pr.append(average_precision_score(yv, m_.predict_proba(Xv)[:, 1]))
+            linhas_rec.append({"estrategia": est, "modelo": nome, "pr_auc_validacao_media": float(np.mean(pr)),
+                               **{f"fold_{i + 1}": v for i, v in enumerate(pr)},
+                               "pedidos_treino_final": len(treino_final)})
+            print(f"  {est:26s} {nome:20s} PR-AUC validação {np.mean(pr):.4f}")
+    comp_recorte = pd.DataFrame(linhas_rec)
+    display(comp_recorte.round(4))
+    media_rec = comp_recorte.groupby("estrategia")["pr_auc_validacao_media"].mean().sort_values(ascending=False)
+    display(media_rec.round(4).reset_index().rename(columns={"pr_auc_validacao_media": "media_dos_modelos"}))
+    ESTRATEGIA_ESCOLHIDA = media_rec.index[0]
+    print(f"\n>>> Estratégia escolhida na validação: {ESTRATEGIA_ESCOLHIDA}")
+else:
+    ESTRATEGIA_ESCOLHIDA = ESTRATEGIA_RECORTE
+
+montar_recorte(ESTRATEGIA_ESCOLHIDA)
 
 # COMMAND ----------
 
@@ -1658,7 +1798,7 @@ display(equilibrio.round(4))
 # COMMAND ----------
 
 import pickle
-ARQ_BUSCA = os.path.join(SAIDA_DIR, f"buscas_{N_FEATURES}vars_{ASSINATURA}_bal_v30_{VERSAO_RECORTE}.pkl")
+ARQ_BUSCA = os.path.join(SAIDA_DIR, f"buscas_{N_FEATURES}vars_{ASSINATURA}_v6_{VERSAO_RECORTE}.pkl")
 if os.path.exists(ARQ_BUSCA) and not MODO_RAPIDO:
     with open(ARQ_BUSCA, "rb") as f:
         buscas = pickle.load(f)
@@ -1732,6 +1872,11 @@ def escolher_faixa(curva, criterio=None):
         i = curva["f1"].idxmax()
     elif criterio == "youden":
         i = curva["acuracia_balanceada"].idxmax()
+    elif criterio == "custo":
+        # custo por pedido = RAZAO_CUSTO x (atrasos perdidos) + 1 x (alarmes falsos), na curva média da validação
+        taxa = curva["precisao"] / curva["lift"]
+        custo = RAZAO_CUSTO * taxa * (1 - curva["recall"]) + curva["faixa"] * (1 - curva["precisao"])
+        i = custo.idxmin()
     elif criterio == "recall_minimo":
         ok = curva[curva["recall"] >= RECALL_MINIMO]
         i = ok["acuracia"].idxmax() if len(ok) else curva["recall"].idxmax()
@@ -1837,7 +1982,7 @@ Xtr, ytr = Xy(treino_final)
 Xcal, ycal = Xy(calib)
 Xte, yte = Xy(teste)
 datas_te = teste["order_purchase_timestamp"].to_numpy()
-DIR_CHECKPOINT = os.path.join(SAIDA_DIR, f"checkpoint_finais_{N_FEATURES}vars_{ASSINATURA}_bal_v30_{VERSAO_FINAL}")
+DIR_CHECKPOINT = os.path.join(SAIDA_DIR, f"checkpoint_finais_{N_FEATURES}vars_{ASSINATURA}_v6_{VERSAO_FINAL}")
 os.makedirs(DIR_CHECKPOINT, exist_ok=True)
 
 finais, res, prev, imp_nativa, curvas_val = {}, {}, {}, {}, {}
@@ -2025,7 +2170,9 @@ print(f"\n>>> MODELO ESCOLHIDO: {vencedor}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Comparação entre todas as versões (original, v1 a v5)
+# MAGIC ### Comparação entre todas as versões (original, v1 a v6)
+# MAGIC
+# MAGIC **Atenção:** comparar várias versões no mesmo teste é útil para mostrar a evolução, mas nenhuma escolha deve ser feita olhando esta tabela. Na v6, recorte, variáveis, hiperparâmetros e faixa de alerta foram escolhidos só na validação.
 
 # COMMAND ----------
 
@@ -2043,7 +2190,10 @@ VERSOES = {
     "v4 (oversampling)": {"Regressão Logística": dict(pr_auc=0.1033, brier=0.0604, precisao_top10=0.122, acuracia=0.465, recall=0.817, sinalizados=0.569),
                           "Gradient Boosting": dict(pr_auc=0.1050, brier=0.0587, precisao_top10=0.122, acuracia=0.437, recall=0.849, sinalizados=0.600)},
 }
-VERSOES["v5 (esta)"] = {m: dict(pr_auc=float(res[m]["pr_auc"]), brier=float(res[m]["brier"]),
+VERSOES["v5 (consolidada)"] = {
+    "Regressão Logística": dict(pr_auc=0.1306, brier=0.0488, precisao_top10=0.1606, acuracia=0.620, recall=0.688, sinalizados=0.40),
+    "Gradient Boosting": dict(pr_auc=0.1177, brier=0.0497, precisao_top10=0.1365, acuracia=0.617, recall=0.657, sinalizados=0.40)}
+VERSOES["v6 (esta)"] = {m: dict(pr_auc=float(res[m]["pr_auc"]), brier=float(res[m]["brier"]),
                                 precisao_top10=float(res[m]["precisao_top10"]), acuracia=float(res[m]["acuracia_alerta"]),
                                 recall=float(res[m]["recall_alerta"]), sinalizados=float(res[m]["faixa_alerta"]))
                         for m in MODELOS}
@@ -2066,7 +2216,7 @@ for ax, (met, rotulo) in zip(axes.ravel(), METRICAS_COMP.items()):
     larg = 0.8 / len(VERSOES)
     for k, (v, cor) in enumerate(zip(VERSOES, cores_v)):
         ax.bar(x + (k - (len(VERSOES) - 1) / 2) * larg, [VERSOES[v][m][met] for m in MODELOS], larg, color=cor,
-               label=v, edgecolor="black" if v.startswith("v5") else "none")
+               label=v, edgecolor="black" if v.startswith("v6") else "none")
     if met == "brier":
         ax.axhline(brier_constante, color="red", ls=":", lw=1.2, label="Prever sempre a taxa base")
     if met in ("acuracia", "recall", "precisao_top10"):

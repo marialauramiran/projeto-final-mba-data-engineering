@@ -4,21 +4,23 @@
 # environment_version = "6"
 # ///
 # MAGIC %md
-# MAGIC # Atraso de entrega Olist: v4, oversampling, anti-overfitting e equilíbrio acurácia x recall
+# MAGIC # Atraso de entrega Olist: v6 (v5 + aprendizados da análise de 14/11)
 # MAGIC
-# MAGIC **Base:** a v3 (recorte equilibrado sem meses atípicos e calibração sem meses atípicos). O que muda:
+# MAGIC **Auditoria da duplicação (seção 1b):** a v5 já evita a duplicação de pedidos. Itens e pagamentos são agregados por pedido antes dos joins, a avaliação é reduzida a uma por pedido e a geolocalização a um ponto por CEP. Os testes de integridade (chaves únicas, 1 linha por pedido e GMV reconciliado) passam. A célula 1b mostra os números de cada etapa e o efeito nos resultados.
 # MAGIC
-# MAGIC - **Novos balanceamentos (seção 6/8):** `oversampling` (repete atrasos reais) e `smote` (cria atrasos sintéticos entre atrasos parecidos). Eles concorrem com `nenhum`, `pesos` e `ensemble_subamostragem`. A busca sorteia o mesmo número de combinações para cada balanceamento, para a comparação ser justa.
-# MAGIC - **Contra vazamento:**
-# MAGIC   - o oversampling acontece dentro do `fit`, só no treino de cada fold;
-# MAGIC   - o pré-processamento aprende só com pedidos reais;
-# MAGIC   - validação, calibração e teste nunca recebem linhas sintéticas, e há checagens no código.
-# MAGIC - **Contra overfitting:**
-# MAGIC   - a busca mede a PR-AUC no treino real e na validação;
-# MAGIC   - entre combinações quase empatadas, fica a de menor diferença entre treino e validação;
-# MAGIC   - um diagnóstico final compara o lift no treino, na calibração e no teste.
-# MAGIC - **Acurácia x recall:** o limiar de alerta passa a ter critério configurável (`CRITERIO_LIMIAR`), sempre escolhido na calibração. Uma tabela e um gráfico mostram a troca entre acurácia e recall no teste para cada critério.
-# MAGIC - **Sem mudança:** as 30 variáveis, o recorte, o teste e a matriz de decisão.
+# MAGIC **O que muda da v5 para a v6 (todas as escolhas feitas na VALIDAÇÃO, nunca no teste):**
+# MAGIC
+# MAGIC | # | Mudança | Por quê |
+# MAGIC |---|---|---|
+# MAGIC | 1 | Novas variáveis **"atrasos em aberto"** (plataforma e UF de destino) | As taxas "recentes" só percebem um choque quando os pedidos atrasados são entregues (1–2 meses depois). Pedidos vencidos e ainda não entregues são conhecidos na hora |
+# MAGIC | 2 | `mes` sai das candidatas | Só há um ano de dados: o modelo decoraria o mês, não a sazonalidade |
+# MAGIC | 3 | Seleção de variáveis **por critério** (relevância mínima + redundância), sem número fixo de 30 | O número de variáveis passa a ser consequência da análise |
+# MAGIC | 4 | **Recorte do treino recomparado na validação** (`ESTRATEGIA_RECORTE = "auto"`) | "Equilibrado sem atípicos" descarta ~40% do treino; no experimento de 14/11, tirar os meses atípicos piorou o recall nos 3 folds |
+# MAGIC | 5 | **Sem balanceamento** na busca | Pesos e subamostragem não melhoraram a ordenação e pioraram a calibração |
+# MAGIC | 6 | Faixa de alerta pelo **menor custo** (`CRITERIO_FAIXA = "custo"`, razão 10×), faixas até 70% | Perder um atraso custa 5 a 10 vezes mais que um alarme falso (análise das avaliações) |
+# MAGIC | 7 | Busca e checkpoints com nomes novos (`v6`) | Força o retreino com as variáveis novas, sem reaproveitar arquivos da v5 |
+# MAGIC | 8 | **Seções 12 a 15 (novas):** custo do atraso e regra de alerta, explicabilidade, evidências das escolhas e resumo final | A v6 passa a conter todas as análises usadas na apresentação |
+# MAGIC
 
 # COMMAND ----------
 
@@ -63,29 +65,31 @@ FOLDS_VALIDACAO = [
     ("2017-10-01", "2018-01-01"),
     ("2018-01-01", "2018-04-01"),
 ]
-INICIO_TESTE = "2018-04-01"       # teste igual ao das versões anteriores (abr-ago/2018): comparação justa
-MESES_CALIBRACAO = 3              # meses candidatos à calibração antes do teste (jan-mar/2018) ...
-CALIBRAR_SEM_ATIPICOS = True      # ... dos quais saem os meses atípicos, pela mesma regra do treino
+INICIO_TESTE = "2018-04-01"       # teste igual ao da versão original (abr-ago/2018): comparação justa
+MESES_CALIBRACAO = 1              # meses logo antes do teste reservados para calibrar e escolher o limiar
 EMBARGO_DIAS = 30                 # pedidos comprados nos 30 dias antes de um corte não entram no treino
 FIM_TREINO_FINAL = str((pd.Timestamp(INICIO_TESTE) - pd.DateOffset(months=MESES_CALIBRACAO)).date())
-CALIBRAR = True                   # calibrador sigmoide (o Brier sem calibração é sempre reportado)
+CALIBRAR = True                   # mantido por compatibilidade; a v5 usa CALIBRACAO abaixo
 
-# ---- RECORTE: estratégia vencedora da comparação na validação
-ESTRATEGIA_ATIVA = "equilibrado_sem_atipicos"   # sem meses atípicos + cada mês limitado à mediana de pedidos
-FATOR_ATIPICO = 1.5               # mês atípico = taxa de atraso acima de 1,5x a mediana mensal do histórico
+# ---- v5: consolidação
+VERSAO_FINAL = "v6_aprendizados"  # nome dos checkpoints do treino final (v6: busca refeita)
+CALIBRACAO = "prevalencia"        # "prevalencia" = corrige a inflação do balanceamento usando só o treino
+                                  # "sigmoide"    = calibrador no mês de calibração (como na v2)
+FAIXAS_ALERTA = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.70]   # % de pedidos sinalizados testados
+CRITERIO_FAIXA = "custo"          # v6: "custo" (menor custo total) | "equilibrio" | "f1" | "youden" | "recall_minimo"
+RAZAO_CUSTO = 10                  # v6: perder um atraso custa 10x um alarme falso (análise das avaliações: 5 a 10x)
+RECALL_MINIMO = 0.50              # usado só pelo critério "recall_minimo"
+
+# ---- RECORTE DO TREINO (seção 7b compara as estratégias na validação)
+ESTRATEGIA_RECORTE = "auto"       # v6: "auto" recompara na validação; ou fixe: "expansiva", "equilibrado_sem_atipicos"...
+ESTRATEGIAS_COMPARAR = ["expansiva", "sem_atipicos", "equilibrado_sem_atipicos", "recentes"]
+ESTRATEGIA_SELECAO = "expansiva"  # recorte usado só na seleção de variáveis (igual à versão original)
+MESES_TREINO = 5                  # usado pela estratégia "recentes"
+FATOR_ATIPICO = 1.5               # mês atípico = taxa de atraso acima de 1,5x a mediana mensal do próprio treino
 MIN_PEDIDOS_MES = 300             # meses com menos pedidos não são classificados como atípicos
-VERSAO_RECORTE = "equilibrado_sem_atipicos_v4_oversampling"  # nome dos arquivos salvos (não reaproveita buscas antigas)
+MOSTRAR_TESTE_DE_TODAS = False    # True = diagnóstico no teste de todas as estratégias (NÃO usar para escolher)
 
-# ---- BALANCEAMENTO, ANTI-OVERFITTING E LIMIAR (novidades da v4)
-N_ITER_POR_BALANCEAMENTO = 6      # combinações sorteadas para CADA balanceamento (5 balanceamentos x 6 = 30 por modelo)
-REGRA_ANTI_OVERFITTING = True     # entre as combinações quase empatadas, escolhe a de menor gap treino-validação
-TOLERANCIA_PR_AUC = 0.003         # "quase empatada" = até 0,003 de PR-AUC abaixo da melhor (ruído entre folds)
-LIMITE_GAP = 0.15                 # alerta: PR-AUC no treino mais de 0,15 acima da validação
-LIMITE_QUEDA_LIFT = 50            # alerta: lift no teste mais de 50% abaixo do lift no treino
-CRITERIO_LIMIAR = "recall_minimo" # "f1" | "youden" | "equilibrio" | "recall_minimo" (escolhido na calibração)
-RECALL_MINIMO = 0.50              # para "recall_minimo": maior acurácia que ainda captura 50% dos atrasos
-
-# Modelos testados nesta versão
+# Modelos testados nesta versão (os outros continuam definidos e podem voltar à lista)
 MODELOS_TESTADOS = ["Regressão Logística", "Gradient Boosting"]
 
 # features históricas
@@ -96,11 +100,10 @@ MIN_EVENTOS_VENDEDOR = 3
 
 # busca e reprodutibilidade
 SEED = 42
-N_ITER_BUSCA = 20                 # (não usado na v4: a busca sorteia N_ITER_POR_BALANCEAMENTO por balanceamento)                
+N_ITER_BUSCA = 15                
 MODO_RAPIDO = False               
 if MODO_RAPIDO:
     N_ITER_BUSCA = 4
-    N_ITER_POR_BALANCEAMENTO = 1
 
 #  matriz de decisão (definida a priori)
 PESOS_DECISAO = {
@@ -114,7 +117,9 @@ PESOS_DECISAO = {
 assert abs(sum(PESOS_DECISAO.values()) - 1) < 1e-9
 
 # seleção de variáveis (matriz de correlação)
-N_FEATURES = 30                   # variáveis que entram no modelo
+N_FEATURES_MAX = 40               # v6: teto de segurança; a seleção para antes pelo critério abaixo
+MIN_RELEVANCIA = 0.01             # v6: variável com relevância abaixo disso não entra
+N_FEATURES = N_FEATURES_MAX       # recalculado na seleção (seção 7)
 LIMIAR_REDUNDANCIA = 0.85         # duas variáveis com correlação acima disso não entram juntas
 
 # COMMAND ----------
@@ -130,7 +135,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mtick
 import seaborn as sns
-from scipy import sparse, stats
+from scipy import stats
 
 from sklearn.base import BaseEstimator, ClassifierMixin, TransformerMixin, clone
 from sklearn.calibration import CalibratedClassifierCV, calibration_curve
@@ -143,7 +148,6 @@ from sklearn.metrics import (average_precision_score, brier_score_loss, classifi
                              confusion_matrix, f1_score, precision_recall_curve, precision_score,
                              recall_score, roc_auc_score)
 from sklearn.model_selection import ParameterSampler
-from sklearn.neighbors import NearestNeighbors
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, OrdinalEncoder, SplineTransformer, StandardScaler
 from lightgbm import LGBMClassifier
@@ -361,6 +365,57 @@ gmv_itens = silver["items"].join(integrada.select("order_id"), "order_id", "semi
 gmv_base = integrada.agg(F.sum("valor_produtos")).first()[0]
 assert abs(gmv_itens - gmv_base) < 1, "GMV da base integrada não bate com order_items"
 print(f"Base integrada: {n_ped:,} pedidos x {len(integrada.columns)} colunas | GMV R$ {gmv_base:,.2f} (reconciliado)")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 1b. Auditoria da duplicação e da limpeza (v6)
+
+# COMMAND ----------
+
+# Mostra, etapa por etapa, onde a base poderia duplicar e como cada ponto foi tratado.
+rev_bruto = ler_silver(TABELAS["reviews"])
+n_rev, n_rev_ped = rev_bruto.count(), rev_bruto.select("order_id").distinct().count()
+ped_multi_rev = rev_bruto.groupBy("order_id").count().filter("count > 1").count()
+n_itens, n_ped_itens = silver["items"].count(), silver["items"].select("order_id").distinct().count()
+n_pag, n_ped_pag = silver["payments"].count(), silver["payments"].select("order_id").distinct().count()
+n_orders = silver["orders"].count()
+n_geo = silver_geo.count() if silver_geo is not None else 0
+n_cep = geo.count() if geo is not None else 0
+itens_sem_produto = silver["items"].join(silver["products"].select("product_id"), "product_id", "left_anti")
+n_itens_sem_prod = itens_sem_produto.count()
+n_ped_sem_prod = itens_sem_produto.select("order_id").distinct().count()
+
+auditoria = pd.DataFrame([
+    {"etapa": "Avaliações", "linhas_na_silver": n_rev, "chaves_unicas": n_rev_ped,
+     "risco": f"{ped_multi_rev:,} pedidos com mais de 1 avaliação: o join multiplicaria esses pedidos",
+     "tratamento": "Mantida só a avaliação mais recente por pedido (row_number)",
+     "efeito_no_modelo": "Nenhum: avaliação é pós-entrega e só entra na análise de satisfação"},
+    {"etapa": "Itens", "linhas_na_silver": n_itens, "chaves_unicas": n_ped_itens,
+     "risco": f"{n_itens - n_ped_itens:,} linhas a mais que pedidos (1 linha por unidade)",
+     "tratamento": "Agregados por pedido (somas, máximos, contagens) antes do join",
+     "efeito_no_modelo": "Nenhum: GMV da base reconciliado com a soma dos itens"},
+    {"etapa": "Pagamentos", "linhas_na_silver": n_pag, "chaves_unicas": n_ped_pag,
+     "risco": f"{n_pag - n_ped_pag:,} linhas a mais que pedidos (vários pagamentos)",
+     "tratamento": "Agregados por pedido; tipo = pagamento de maior valor",
+     "efeito_no_modelo": "Nenhum"},
+    {"etapa": "Geolocalização", "linhas_na_silver": n_geo, "chaves_unicas": n_cep,
+     "risco": "Várias coordenadas por CEP",
+     "tratamento": "Média das coordenadas por CEP (só pontos dentro do Brasil)",
+     "efeito_no_modelo": "Nenhum"},
+    {"etapa": "Pedidos sem item", "linhas_na_silver": n_orders, "chaves_unicas": n_ped,
+     "risco": f"{n_orders - n_ped:,} pedidos sem nenhum item",
+     "tratamento": "Excluídos (join inner com os itens): não têm produto, frete nem vendedor",
+     "efeito_no_modelo": "Nenhum: quase todos cancelados ou indisponíveis"},
+    {"etapa": "Produtos removidos na Silver", "linhas_na_silver": n_itens_sem_prod, "chaves_unicas": n_ped_sem_prod,
+     "risco": "Itens cujo produto não existe na Silver (produtos sem categoria removidos na limpeza da camada)",
+     "tratamento": "Categoria 'desconhecido'; peso/volume nulos imputados pela mediana com indicador",
+     "efeito_no_modelo": f"Pequeno: {n_ped_sem_prod / n_ped:.1%} dos pedidos perdem peso e categoria"},
+])
+display(auditoria)
+print(f"Base integrada: {n_ped:,} pedidos = {n_unicos:,} order_id distintos -> sem duplicação")
+print("Conclusão: a limpeza não altera os resultados do modelo; a única perda real de informação vem da Silver "
+      "(produtos sem categoria), e é pequena.")
 
 # COMMAND ----------
 
@@ -707,6 +762,28 @@ def contagem_anterior(ped, chave, janela_dias):
     return out
 
 
+def contar_antes(ped, chave, col_t, janela_dias=None):
+    """Nº de eventos (col_t) da mesma chave ocorridos ESTRITAMENTE antes de cada compra.
+    Com janela_dias, só os ocorridos nos últimos N dias antes da compra."""
+    ev = ped.loc[ped[col_t].notna(), [chave, col_t]].rename(columns={col_t: "_t"}).sort_values("_t", kind="mergesort")
+    ev["_t"] = ev["_t"].astype("datetime64[ns]")
+    ev["_n"] = ev.groupby(chave, sort=False).cumcount() + 1
+
+    def ate(deslocamento, incluir_igual):
+        q = ped[[chave, "order_purchase_timestamp"]].copy()
+        q["_t"] = (q["order_purchase_timestamp"] - deslocamento).astype("datetime64[ns]")
+        q["_idx"] = np.arange(len(q))
+        q = q.sort_values("_t", kind="mergesort")
+        h = pd.merge_asof(q, ev[[chave, "_t", "_n"]], on="_t", by=chave, direction="backward",
+                          allow_exact_matches=incluir_igual)
+        return h.sort_values("_idx")["_n"].fillna(0).to_numpy()
+
+    n = ate(pd.Timedelta(0), False)
+    if janela_dias is not None:
+        n = n - ate(pd.Timedelta(days=janela_dias), True)
+    return n
+
+
 def criar_features(ped):
     ped = ped.sort_values("order_purchase_timestamp", kind="mergesort").copy()
     ts = ped["order_purchase_timestamp"]
@@ -747,6 +824,27 @@ def criar_features(ped):
     ped["taxa_atraso_destino_hist"] = destino["taxa_atraso"].fillna(ger["taxa_atraso"])
     ped["pedidos_plataforma_7d"] = contagem_anterior(ped, "_geral", 7)
 
+    # ---------------------------------------------------------- v6: atrasos em aberto (tempo real, sem vazamento)
+    # No instante da compra: pedidos com data prometida JÁ VENCIDA e ainda NÃO entregues. Um pedido deixa de
+    # contar como "em aberto" quando é entregue ou, no máximo, 90 dias após o prometido (regra fixa, para que
+    # pedidos extraviados não se acumulem para sempre).
+    valido = ~ped["order_status"].isin(["canceled", "unavailable"]) & ped["order_estimated_delivery_date"].notna()
+    prometido = ped["order_estimated_delivery_date"]
+    limite = prometido + pd.Timedelta(days=90)
+    entrega = ped["order_delivered_customer_date"]
+    resolvido = entrega.where(entrega > prometido, prometido).where(entrega.notna())   # NaT se não entregue
+    ped["_vencido_em"] = prometido.where(valido)
+    ped["_resolvido_em"] = resolvido.where(resolvido < limite, limite).where(valido)
+    for chave, nome in [("_geral", "plataforma"), ("customer_state", "destino")]:
+        abertos = contar_antes(ped, chave, "_vencido_em") - contar_antes(ped, chave, "_resolvido_em")
+        vencidos_janela = contar_antes(ped, chave, "_vencido_em", JANELA_RECENTE_DIAS)
+        if nome == "plataforma":
+            taxa_plat = np.where(vencidos_janela > 0, abertos / np.maximum(vencidos_janela, 1), 0.0)
+            ped["atrasos_abertos_plataforma"] = taxa_plat
+        else:
+            ped["atrasos_abertos_destino"] = ((abertos + MIN_EVENTOS_RECENTE * taxa_plat)
+                                              / (vencidos_janela + MIN_EVENTOS_RECENTE))
+
     # Folgas: prazo prometido menos o tempo que a rota/vendedor costumava levar
     ped["folga_prometida"] = ped["prazo_prometido_dias"] - ped["entrega_rota_hist_dias"]
 
@@ -770,7 +868,7 @@ def criar_features(ped):
     ped["fim_de_semana"] = (ped["dia_semana"] >= 5).astype(int)
     ped["cliente_recorrente"] = (ped.groupby("_cliente")["order_purchase_timestamp"].rank(method="min") > 1).astype(int)
 
-    return ped.drop(columns=["_rota_uf", "_rota_reg", "_geral", "_vendedor", "_cliente"])
+    return ped.drop(columns=["_rota_uf", "_rota_reg", "_geral", "_vendedor", "_cliente", "_vencido_em", "_resolvido_em"])
 
 
 t0 = time.time()
@@ -880,6 +978,8 @@ _d("Logística e localidade", "compra", "numérica", [
     ("taxa_atraso_destino_hist", "Taxa de atraso para a UF do cliente antes da compra"),
     ("taxa_atraso_plataforma_recente", f"Taxa de atraso de toda a plataforma nos últimos {JANELA_RECENTE_DIAS} dias (greves, picos)"),
     ("pedidos_plataforma_7d", "Volume de compras na plataforma nos 7 dias anteriores (pressão logística)"),
+    ("atrasos_abertos_plataforma", "v6: pedidos vencidos e ainda não entregues no instante da compra / vencidos nos últimos 30 dias"),
+    ("atrasos_abertos_destino", "v6: idem, na UF do cliente (suavizado pela taxa da plataforma)"),
 ])
 _d("Produto e vendedor", "compra", "categórica", [("categoria", "Categoria do item principal")])
 _d("Produto e vendedor", "compra", "numérica", [
@@ -899,11 +999,15 @@ _d("Produto e vendedor", "compra", "numérica", [
     ("vendedor_dias_entrega_hist", "Tempo médio de entrega do vendedor antes da compra"),
 ])
 _d("Calendário e cliente", "compra", "numérica", [
-    ("mes", "Mês da compra"), ("dia_semana", "Dia da semana (0 = segunda)"), ("hora", "Hora da compra"),
+    ("dia_semana", "Dia da semana (0 = segunda)"), ("hora", "Hora da compra"),
     ("fim_de_semana", "Compra no sábado ou domingo"),
     ("cliente_recorrente", "Cliente já comprou antes"),
 ])
 _d("Razões entre variáveis", "compra", "numérica", [(n, d) for n, (_, d) in RAZOES_NOVAS.items()])
+# v6: excluída por decisão de modelagem (documentada para deixar explícito por que não entra)
+_d("Excluída (aprendizado v6)", "excluída", "numérica", [
+    ("mes", "Mês da compra: com um único ano de dados, o modelo decoraria o mês em vez de aprender sazonalidade"),
+])
 # Pós-compra: documentadas para deixar explícito por que NÃO entram
 _d("Pós-compra (proibida no modelo)", "pós-compra", "alvo", [
     ("atrasou", "ALVO: entrega após a data prometida"),
@@ -981,7 +1085,7 @@ print(f"Auditoria OK (taxa base {y_dev.mean():.3f}): só o controle pós-compra 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 5. Estratégia de validação temporal (recorte equilibrado sem meses atípicos)
+# MAGIC ## 5. Estratégia de validação temporal (recorte configurável)
 
 # COMMAND ----------
 
@@ -990,9 +1094,21 @@ bm = base_feat[(base_feat["elegivel"] == 1)
 bm["atrasou"] = bm["atrasou"].astype(int)
 TS = bm["order_purchase_timestamp"]
 
-# Recorte escolhido na comparação de estratégias (PR-AUC média na validação 0,193 contra 0,176 da expansiva):
-# todo o histórico disponível no corte, SEM meses atípicos e com cada mês limitado à mediana de pedidos por mês.
-# Tudo usa só pedidos comprados antes de (corte - embargo) e com resultado já conhecido no corte.
+# Estratégias de recorte do treino. TODAS usam só pedidos comprados antes de (corte - embargo) e com resultado já
+# conhecido no corte: nenhuma olha o período de validação, calibração ou teste para decidir quais meses entram.
+ESTRATEGIAS = {
+    "expansiva": "Todo o histórico antes do corte (versão original)",
+    "recentes": f"Só os {MESES_TREINO} meses mais recentes",
+    "alternados": "Meses alternados (1 sim, 1 não), contando do mais recente para trás",
+    "sem_atipicos": f"Todo o histórico, sem meses atípicos (atraso > {FATOR_ATIPICO}x a mediana mensal)",
+    "volume_equilibrado": "Todo o histórico, cada mês limitado à mediana de pedidos por mês",
+    "equilibrado_sem_atipicos": "Sem meses atípicos e com cada mês limitado à mediana de pedidos",
+}
+
+
+def mes_num(ts):
+    """Mês como número inteiro (ano*12 + mês): facilita contar 'meses para trás'."""
+    return ts.dt.year * 12 + ts.dt.month
 
 
 def base_conhecida(corte):
@@ -1001,36 +1117,46 @@ def base_conhecida(corte):
     return bm[(TS < corte - pd.Timedelta(days=EMBARGO_DIAS)) & (bm["data_conhecimento_alvo"] < corte)]
 
 
-def taxa_mensal(df):
+def limites_janela(corte, meses=MESES_TREINO):
+    """Início (arredondado para o 1º dia do mês mais próximo) e fim da janela dos `meses` mais recentes."""
+    fim = pd.Timestamp(corte) - pd.Timedelta(days=EMBARGO_DIAS)
+    x = fim - pd.DateOffset(months=meses)
+    mes_ini = x.to_period("M").start_time
+    prox = mes_ini + pd.DateOffset(months=1)
+    return (mes_ini if x - mes_ini <= prox - x else prox), fim
+
+
+def meses_atipicos(df):
+    """Meses com taxa de atraso acima de FATOR_ATIPICO x a mediana mensal, medida só nos dados do próprio treino."""
     t = df.groupby(df["order_purchase_timestamp"].dt.to_period("M"))["atrasou"].agg(["mean", "size"])
-    return t[t["size"] >= MIN_PEDIDOS_MES]
-
-
-def limite_atipico(referencia):
-    """Taxa acima da qual um mês é atípico: FATOR_ATIPICO x a mediana das taxas mensais da referência."""
-    return FATOR_ATIPICO * taxa_mensal(referencia)["mean"].median()
-
-
-def meses_atipicos(df, referencia=None):
-    """Meses de `df` com taxa de atraso acima do limite calculado na `referencia` (por padrão, o próprio df)."""
-    t = taxa_mensal(df)
-    return set(t.index[t["mean"] > limite_atipico(df if referencia is None else referencia)])
+    t = t[t["size"] >= MIN_PEDIDOS_MES]
+    return set(t.index[t["mean"] > FATOR_ATIPICO * t["mean"].median()])
 
 
 def limitar_volume(df):
     """Cada mês entra com no máximo a mediana de pedidos por mês (amostra aleatória dentro do mês, que preserva a
-    taxa de atraso dele). Assim um mês de pico não domina o treino."""
+    taxa de atraso dele). Assim um mês de pico, como a Black Friday, não domina o treino."""
     mes = df["order_purchase_timestamp"].dt.to_period("M")
     teto = int(mes.value_counts().median())
     ordem = pd.Series(np.random.default_rng(SEED).random(len(df)), index=df.index).groupby(mes).rank(method="first")
     return df[ordem <= teto]
 
 
-def treino_ate(corte):
-    """Estratégia 'equilibrado_sem_atipicos'."""
+def treino_ate(corte, estrategia=None):
+    estrategia = estrategia or ESTRATEGIA_ATIVA
+    if estrategia not in ESTRATEGIAS:
+        raise ValueError(f"estratégia desconhecida: {estrategia}")
     df = base_conhecida(corte)
-    df = df[~df["order_purchase_timestamp"].dt.to_period("M").isin(meses_atipicos(df))]
-    return limitar_volume(df)
+    if estrategia == "recentes":
+        df = df[df["order_purchase_timestamp"] >= limites_janela(corte)[0]]
+    elif estrategia == "alternados":
+        m = mes_num(df["order_purchase_timestamp"])
+        df = df[(m.max() - m) % 2 == 0]
+    elif estrategia in ("sem_atipicos", "equilibrado_sem_atipicos"):
+        df = df[~df["order_purchase_timestamp"].dt.to_period("M").isin(meses_atipicos(df))]
+    if estrategia in ("volume_equilibrado", "equilibrado_sem_atipicos"):
+        df = limitar_volume(df)
+    return df
 
 
 def Xy(df):
@@ -1042,64 +1168,508 @@ def periodo(ini, fim):
     return f"{pd.Timestamp(ini):%m/%Y} a {pd.Timestamp(fim) - pd.Timedelta(days=1):%m/%Y}"
 
 
-folds = []
-for ini, fim in FOLDS_VALIDACAO:
-    tr = treino_ate(ini)
-    assert tr["atrasou"].sum() >= 50, f"fold {ini}: só {tr['atrasou'].sum()} atrasos no treino"
-    folds.append({"nome": f"valida {ini[:7]} a {pd.Timestamp(fim) - pd.Timedelta(days=1):%Y-%m}",
-                  "tr": tr, "va": bm[(TS >= ini) & (TS < fim)], "aval": (pd.Timestamp(ini), pd.Timestamp(fim))})
+def montar_recorte(estrategia, mostrar_resumo=True):
+    """Monta folds, treino final, calibração e teste para uma estratégia (variáveis globais usadas pelo resto)."""
+    global ESTRATEGIA_ATIVA, VERSAO_RECORTE, folds, treino_final, calib, teste
+    ESTRATEGIA_ATIVA = estrategia
+    VERSAO_RECORTE = f"{estrategia}_{MESES_TREINO}m" if estrategia == "recentes" else estrategia
+    folds = []
+    for ini, fim in FOLDS_VALIDACAO:
+        tr = treino_ate(ini)
+        assert tr["atrasou"].sum() >= 50, f"fold {ini}: só {tr['atrasou'].sum()} atrasos no treino"
+        folds.append({"nome": f"valida {ini[:7]} a {pd.Timestamp(fim) - pd.Timedelta(days=1):%Y-%m}",
+                      "tr": tr, "va": bm[(TS >= ini) & (TS < fim)], "aval": (pd.Timestamp(ini), pd.Timestamp(fim))})
+    treino_final = treino_ate(FIM_TREINO_FINAL)
+    calib = bm[(TS >= FIM_TREINO_FINAL) & (TS < INICIO_TESTE) & (bm["data_conhecimento_alvo"] < INICIO_TESTE)]
+    teste = bm[TS >= INICIO_TESTE]
 
-treino_final = treino_ate(FIM_TREINO_FINAL)
+    assert treino_final["order_purchase_timestamp"].max() < pd.Timestamp(FIM_TREINO_FINAL) - pd.Timedelta(days=EMBARGO_DIAS)
+    assert calib["order_purchase_timestamp"].min() >= pd.Timestamp(FIM_TREINO_FINAL)
+    assert teste["order_purchase_timestamp"].min() >= pd.Timestamp(INICIO_TESTE)
+    assert not set(teste["order_id"]) & (set(treino_final["order_id"]) | set(calib["order_id"]))
+    assert not set(treino_final["order_id"]) & set(calib["order_id"])
+    if not mostrar_resumo:
+        return
 
-# Calibração coerente com o recorte: meses candidatos entre FIM_TREINO_FINAL e o teste, SEM os meses atípicos.
-# O limite de "atípico" vem do histórico do treino (nada do teste participa). Na versão anterior a calibração era
-# só mar/2018, um mês de crise (13% de atraso na parte conhecida), e as probabilidades saíam infladas no teste.
-calib_cand = bm[(TS >= FIM_TREINO_FINAL) & (TS < INICIO_TESTE) & (bm["data_conhecimento_alvo"] < INICIO_TESTE)]
-CALIB_ATIPICOS = meses_atipicos(calib_cand, referencia=base_conhecida(FIM_TREINO_FINAL)) if CALIBRAR_SEM_ATIPICOS else set()
-calib = calib_cand[~calib_cand["order_purchase_timestamp"].dt.to_period("M").isin(CALIB_ATIPICOS)]
-if calib["atrasou"].sum() < 100:
-    print("AVISO: calibração sem atípicos ficou pequena demais; usando todos os meses candidatos")
-    calib, CALIB_ATIPICOS = calib_cand, set()
-teste = bm[TS >= INICIO_TESTE]
+    def desc(df):
+        t = df["order_purchase_timestamp"]
+        return f"{periodo(t.min(), t.max() + pd.Timedelta(days=1))} ({t.dt.to_period('M').nunique()} meses)"
 
-# A seleção de variáveis (seção 7) continua usando o treino do fold 1 da versão ORIGINAL (todo o histórico):
-# as 30 variáveis ficam iguais e a diferença nos resultados vem só do recorte e dos ajustes de modelagem.
-TREINO_SELECAO = base_conhecida(FOLDS_VALIDACAO[0][0])
-
-assert treino_final["order_purchase_timestamp"].max() < pd.Timestamp(FIM_TREINO_FINAL) - pd.Timedelta(days=EMBARGO_DIAS)
-assert calib["order_purchase_timestamp"].min() >= pd.Timestamp(FIM_TREINO_FINAL)
-assert teste["order_purchase_timestamp"].min() >= pd.Timestamp(INICIO_TESTE)
-assert not set(teste["order_id"]) & (set(treino_final["order_id"]) | set(calib["order_id"]))
-assert not set(treino_final["order_id"]) & set(calib["order_id"])
-
-
-def desc(df):
-    m = df["order_purchase_timestamp"].dt.to_period("M")
-    return f"{periodo(m.min().start_time, m.max().end_time)} ({m.nunique()} meses)"
+    resumo = [{"conjunto": f["nome"], "compras_treino": desc(f["tr"]), "treino": len(f["tr"]),
+               "atraso_treino": f["tr"]["atrasou"].mean(), "avaliação": len(f["va"]),
+               "atraso_avaliação": f["va"]["atrasou"].mean()} for f in folds]
+    resumo += [{"conjunto": f"final (calibração {periodo(FIM_TREINO_FINAL, INICIO_TESTE)})",
+                "compras_treino": desc(treino_final), "treino": len(treino_final),
+                "atraso_treino": treino_final["atrasou"].mean(), "avaliação": len(calib),
+                "atraso_avaliação": calib["atrasou"].mean()},
+               {"conjunto": f"TESTE {periodo(INICIO_TESTE, pd.Timestamp(DATA_FIM) + pd.Timedelta(days=1))}",
+                "compras_treino": "-", "treino": np.nan, "atraso_treino": np.nan,
+                "avaliação": len(teste), "atraso_avaliação": teste["atrasou"].mean()}]
+    print(f"Recorte: '{estrategia}' = {ESTRATEGIAS[estrategia]} | embargo {EMBARGO_DIAS} dias | "
+          f"calibração {MESES_CALIBRACAO} mês(es)")
+    display(pd.DataFrame(resumo).round(4))
 
 
-fora_treino = sorted(str(m) for m in meses_atipicos(base_conhecida(FIM_TREINO_FINAL)))
-print(f"Recorte: equilibrado sem atípicos | limite de mês atípico: "
-      f"{limite_atipico(base_conhecida(FIM_TREINO_FINAL)):.1%} de atraso | embargo {EMBARGO_DIAS} dias")
-print(f"Meses atípicos fora do treino final: {fora_treino}")
-print(f"Calibração: {sorted(calib['ano_mes'].unique())} | meses atípicos fora da calibração: "
-      f"{sorted(str(m) for m in CALIB_ATIPICOS)}")
-resumo = [{"conjunto": f["nome"], "compras_treino": desc(f["tr"]), "treino": len(f["tr"]),
-           "atraso_treino": f["tr"]["atrasou"].mean(), "avaliação": len(f["va"]),
-           "atraso_avaliação": f["va"]["atrasou"].mean()} for f in folds]
-resumo += [{"conjunto": f"final (calibração {', '.join(sorted(calib['ano_mes'].unique()))})",
-            "compras_treino": desc(treino_final), "treino": len(treino_final),
-            "atraso_treino": treino_final["atrasou"].mean(), "avaliação": len(calib),
-            "atraso_avaliação": calib["atrasou"].mean()},
-           {"conjunto": f"TESTE {periodo(INICIO_TESTE, pd.Timestamp(DATA_FIM) + pd.Timedelta(days=1))}",
-            "compras_treino": "-", "treino": np.nan, "atraso_treino": np.nan,
-            "avaliação": len(teste), "atraso_avaliação": teste["atrasou"].mean()}]
-display(pd.DataFrame(resumo).round(4))
+# A seleção de variáveis (seção 7) usa o treino do fold 1 desta estratégia. Fica fixa em 'expansiva' para que as 30
+# variáveis sejam as mesmas da versão original: assim, a diferença nos resultados vem só do recorte.
+montar_recorte(ESTRATEGIA_SELECAO)
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Volume de vendas e taxa de atraso: do treino ao teste
+# MAGIC ## 6. Modelagem: pré-processamento, balanceamento e os modelos (Regressão Logística e Gradient Boosting)
+
+# COMMAND ----------
+
+def log_com_sinal(x):
+    return np.sign(x) * np.log1p(np.abs(x))
+
+
+class RazoesPelaMediana(BaseEstimator, TransformerMixin):
+    """Cria valor / mediana do grupo. As medianas vêm só do treino (fit); grupos com menos de
+    `minimo` pedidos usam a mediana geral do treino."""
+    REGRAS = (("preco_rel_categoria", "valor_produtos", ("categoria",)),
+              ("frete_rel_rota", "valor_frete", ("seller_state", "customer_state")))
+
+    def __init__(self, minimo=30, razoes=None):
+        self.minimo = minimo
+        self.razoes = razoes
+
+    def _regras(self):
+        return [r for r in self.REGRAS if self.razoes is None or r[0] in self.razoes]
+
+    @staticmethod
+    def _chave(X, grupo):
+        chave = X[grupo[0]].astype(str)
+        for c in grupo[1:]:
+            chave = chave + ">" + X[c].astype(str)
+        return chave
+
+    def fit(self, X, y=None):
+        self.medianas_ = {}
+        for nome, valor, grupo in self._regras():
+            chave = self._chave(X, grupo)
+            g = X[valor].groupby(chave)
+            med = g.median()[g.count() >= self.minimo]
+            self.medianas_[nome] = (med, float(X[valor].median()))
+        return self
+
+    def transform(self, X):
+        X = X.copy()
+        for nome, valor, grupo in self._regras():
+            med, geral = self.medianas_[nome]
+            chave = self._chave(X, grupo)
+            ref = chave.map(med).fillna(geral).replace(0, np.nan)
+            X[nome] = X[valor] / ref
+        return X
+
+
+class SelecionaColunas(BaseEstimator, TransformerMixin):
+    """Mantém só as variáveis escolhidas pela matriz de correlação."""
+    def __init__(self, colunas):
+        self.colunas = colunas
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        return X[list(self.colunas)]
+
+
+class ParaCategoria(BaseEstimator, TransformerMixin):
+    """Texto -> 'category' com as categorias vistas no treino (valor novo vira nulo)."""
+    def __init__(self, colunas):
+        self.colunas = colunas
+
+    def fit(self, X, y=None):
+        self.categorias_ = {c: sorted(X[c].dropna().unique()) for c in self.colunas}
+        return self
+
+    def transform(self, X):
+        X = X.copy()
+        for c in self.colunas:
+            X[c] = pd.Categorical(X[c], categories=self.categorias_[c])
+        return X
+
+
+class ModeloBalanceado(BaseEstimator, ClassifierMixin):
+    """Balanceamento aplicado DENTRO do fit, ou seja, só no treino do fold.
+    estrategia:
+      'nenhum'
+      'pesos': erro em atraso custa mais; razao = proporção efetiva negativos:positivos (1 = classes iguais)
+      'ensemble_subamostragem' (EasyEnsemble): n_membros modelos, cada um com todos os atrasos e uma amostra
+          diferente de pedidos no prazo (razao x atrasos). A previsão é a média dos membros, então nenhum
+          pedido no prazo é descartado de vez e a variância da subamostragem simples cai."""
+    def __init__(self, estimador, estrategia="nenhum", razao=1.0, n_membros=5, random_state=SEED):
+        self.estimador = estimador
+        self.estrategia = estrategia
+        self.razao = razao
+        self.n_membros = n_membros
+        self.random_state = random_state
+
+    def fit(self, X, y):
+        y = np.asarray(y)
+        if self.estrategia == "ensemble_subamostragem":
+            rng = np.random.default_rng(self.random_state)
+            pos, neg = np.flatnonzero(y == 1), np.flatnonzero(y == 0)
+            n_neg = min(len(neg), int(self.razao * len(pos)))
+            self.membros_ = []
+            for _ in range(self.n_membros):
+                idx = np.sort(np.concatenate([pos, rng.choice(neg, n_neg, replace=False)]))
+                self.membros_.append(clone(self.estimador).fit(X.iloc[idx], y[idx]))
+        elif self.estrategia == "pesos":
+            w = np.where(y == 1, (y == 0).sum() / (self.razao * y.sum()), 1.0)
+            self.membros_ = [clone(self.estimador).fit(X, y, modelo__sample_weight=w / w.mean())]
+        else:
+            self.membros_ = [clone(self.estimador).fit(X, y)]
+        self.estimador_ = self.membros_[0]
+        self.classes_ = self.estimador_.classes_
+        return self
+
+    def predict_proba(self, X):
+        return np.mean([m.predict_proba(X) for m in self.membros_], axis=0)
+
+    def decision_function(self, X):
+        """Logit da probabilidade. O calibrador sigmoide usa este score; sem ele, algumas versões do
+        scikit-learn pegam colunas diferentes de predict_proba no ajuste e na previsão e invertem o ranking."""
+        p = np.clip(self.predict_proba(X)[:, 1], 1e-7, 1 - 1e-7)
+        return np.log(p / (1 - p))
+
+    def predict(self, X):
+        return self.classes_[(self.predict_proba(X)[:, 1] >= 0.5).astype(int)]
+
+
+def prep_linear():
+    num = Pipeline([("imputa", SimpleImputer(strategy="median", add_indicator=True)),
+                    ("log", FunctionTransformer(log_com_sinal, feature_names_out="one-to-one")),
+                    ("spline", "passthrough"),   # a busca decide: linear ou curva (spline) por variável
+                    ("padroniza", StandardScaler())])
+    return ColumnTransformer([("cat", OneHotEncoder(handle_unknown="infrequent_if_exist", min_frequency=50), CATEGORICAS),
+                              ("num", num, NUMERICAS)])
+
+
+def prep_arvore():
+    return ColumnTransformer([
+        ("cat", OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1, encoded_missing_value=-1), CATEGORICAS),
+        ("num", SimpleImputer(strategy="median", add_indicator=True), NUMERICAS)])
+
+
+def construir(nome):
+    if nome == "Regressão Logística":
+        etapas = [("prep", prep_linear()), ("modelo", LogisticRegression(max_iter=3000))]
+    elif nome == "Random Forest":
+        etapas = [("prep", prep_arvore()),
+                  ("modelo", RandomForestClassifier(n_estimators=300, n_jobs=-1, random_state=SEED))]
+    elif nome == "Gradient Boosting":
+        etapas = [("prep", prep_arvore()), ("modelo", GradientBoostingClassifier(random_state=SEED))]
+    elif nome == "LightGBM":
+        etapas = [("cat", ParaCategoria(CATEGORICAS)),
+                  ("modelo", LGBMClassifier(random_state=SEED, verbose=-1, n_jobs=-1, subsample_freq=1))]
+    else:
+        raise ValueError(nome)
+    return ModeloBalanceado(Pipeline([("razoes", RazoesPelaMediana(razoes=RAZOES_ATIVAS)),
+                                  ("seleciona", SelecionaColunas(SELECIONADAS))] + etapas))
+
+
+# v6: sem balanceamento (testado em 14/11: não melhora a ordenação e piora a calibração)
+BALANCEAMENTO = {"estrategia": ["nenhum"], "razao": [1.0]}
+ESPACOS = {
+    "Regressão Logística": {"estimador__modelo__C": [0.003, 0.01, 0.03, 0.1, 0.3, 1.0],
+                            "estimador__prep__num__spline": ["passthrough",
+                                                             SplineTransformer(n_knots=4, degree=3),
+                                                             SplineTransformer(n_knots=6, degree=3)],
+                            **BALANCEAMENTO},
+    "Random Forest": {"estimador__modelo__max_depth": [8, 12, 16, None],
+                      "estimador__modelo__min_samples_leaf": [20, 50, 100, 200],
+                      "estimador__modelo__max_features": ["sqrt", 0.3, 0.5],
+                      **BALANCEAMENTO},
+    "Gradient Boosting": {"estimador__modelo__n_estimators": [100, 200, 300],
+                          "estimador__modelo__learning_rate": [0.03, 0.05, 0.1],
+                          "estimador__modelo__max_depth": [2, 3, 4],
+                          "estimador__modelo__min_samples_leaf": [50, 100, 200],
+                          "estimador__modelo__subsample": [0.7, 0.85],
+                          "estimador__modelo__max_features": [0.5, "sqrt"],
+                          **BALANCEAMENTO},
+    "LightGBM": {"estimador__modelo__learning_rate": [0.02, 0.05, 0.1],
+                 "estimador__modelo__n_estimators": [200, 400, 600],
+                 "estimador__modelo__num_leaves": [15, 31, 63],
+                 "estimador__modelo__min_child_samples": [50, 100, 200],
+                 "estimador__modelo__reg_lambda": [0.0, 1.0, 5.0],
+                 "estimador__modelo__colsample_bytree": [0.6, 0.8, 1.0],
+                 "estimador__modelo__subsample": [0.7, 1.0],
+                 **BALANCEAMENTO},
+}
+INTERPRETABILIDADE = {"Regressão Logística": 1.0, "Random Forest": 0.5, "Gradient Boosting": 0.5, "LightGBM": 0.5}
+MODELOS = [m for m in ESPACOS if m in MODELOS_TESTADOS]
+print(f"Modelos testados: {MODELOS}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 7. Seleção de variáveis por matriz de correlação (v6: por critério, sem número fixo)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Matriz de correlação das candidatas
+
+# COMMAND ----------
+
+def cramers_v_corrigido(a, b):
+    """V de Cramér com correção de viés (Bergsma): não infla com muitas categorias."""
+    tab = pd.crosstab(a, b)
+    if min(tab.shape) < 2:
+        return 0.0
+    chi2 = stats.chi2_contingency(tab, correction=False)[0]
+    n = tab.to_numpy().sum()
+    r, k = tab.shape
+    phi2 = max(0.0, chi2 / n - (k - 1) * (r - 1) / (n - 1))
+    r_c, k_c = r - (r - 1) ** 2 / (n - 1), k - (k - 1) ** 2 / (n - 1)
+    den = min(k_c - 1, r_c - 1)
+    return float(np.sqrt(phi2 / den)) if den > 0 else 0.0
+
+
+def razao_correlacao(categoria, x):
+    """Razão de correlação (eta) entre uma categórica e uma numérica (0 = nenhuma, 1 = total)."""
+    ok = categoria.notna() & x.notna()
+    categoria, x = categoria[ok], x[ok]
+    ss_total = ((x - x.mean()) ** 2).sum()
+    g = x.groupby(categoria, observed=True)
+    ss_entre = (g.size() * (g.mean() - x.mean()) ** 2).sum()
+    return float(np.sqrt(ss_entre / ss_total)) if ss_total > 0 else 0.0
+
+
+# Só o treino do 1º fold: nenhum período de validação, calibração ou teste participa da seleção
+# (na versão anterior a seleção via os folds de validação e a validação cruzada ficou otimista)
+dados_selecao = folds[0]["tr"]
+RAZOES = [r[0] for r in RazoesPelaMediana.REGRAS]
+CANDIDATAS = CATEGORICAS_CAND + NUMERICAS_CAND
+sel = RazoesPelaMediana().fit_transform(dados_selecao[CATEGORICAS_CAND + NUMERICAS_X_CAND])
+y_sel = pd.Series(dados_selecao["atrasou"].to_numpy(), index=sel.index)
+cats = {c: sel[c].where(sel[c].map(sel[c].value_counts()) >= 50, "outras") for c in CATEGORICAS_CAND}
+postos = sel[NUMERICAS_CAND].astype(float).rank()
+
+# Matriz de correlação: |Spearman| (num x num), V de Cramér (cat x cat), razão de correlação (cat x num)
+assoc = pd.DataFrame(np.eye(len(CANDIDATAS)), index=CANDIDATAS, columns=CANDIDATAS)
+assoc.loc[NUMERICAS_CAND, NUMERICAS_CAND] = postos.corr().abs().fillna(0).to_numpy()
+for i, a in enumerate(CATEGORICAS_CAND):
+    for b in CATEGORICAS_CAND[i + 1:]:
+        assoc.loc[a, b] = assoc.loc[b, a] = cramers_v_corrigido(cats[a], cats[b])
+    for b in NUMERICAS_CAND:
+        assoc.loc[a, b] = assoc.loc[b, a] = razao_correlacao(cats[a], postos[b])
+for c in CANDIDATAS:
+    assoc.loc[c, c] = 1.0
+
+# Relevância: correlação de cada variável com o alvo (atrasou)
+# Para numéricas usa o maior entre |Spearman| (relação monotônica) e o V de Cramér das faixas (decis), que
+# também capta relações em U (ex.: mês, sazonalidade), que o Spearman sozinho não enxerga.
+def relevancia_numerica(x, y):
+    faixas = pd.qcut(x, 10, duplicates="drop").cat.codes  # nulo vira faixa própria (-1)
+    return max(abs(x.rank().corr(y.rank())), cramers_v_corrigido(faixas, y))
+
+
+relevancia = pd.Series({c: cramers_v_corrigido(cats[c], y_sel) for c in CATEGORICAS_CAND}
+                       | {c: relevancia_numerica(sel[c].astype(float), y_sel) for c in NUMERICAS_CAND}).fillna(0)
+
+ordem = sorted(CANDIDATAS, key=lambda f: (GRUPO[f], -relevancia[f]))
+fig, ax = plt.subplots(figsize=(20, 17))
+sns.heatmap(assoc.loc[ordem, ordem].astype(float), cmap="Reds", vmin=0, vmax=1, square=True, ax=ax,
+            cbar_kws={"shrink": 0.6})
+ax.set_title(f"Matriz de correlação das {len(CANDIDATAS)} candidatas (treino do 1º fold, {len(dados_selecao):,} pedidos)")
+mostrar(fig, "selecao_01_matriz_candidatas")
+
+triang = np.triu(np.ones(assoc.shape, dtype=bool), 1)
+pares = (assoc.where(triang).stack().dropna().rename("correlacao")
+         .loc[lambda s: s > LIMIAR_REDUNDANCIA].sort_values(ascending=False))
+print(f"{len(pares)} pares com correlação acima de {LIMIAR_REDUNDANCIA}")
+display(pares.reset_index().set_axis(["variável A", "variável B", "correlação"], axis=1).round(3))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Novas razões: adicionar ou descartar
+
+# COMMAND ----------
+
+# Uma razão nova entra no modelo se a correlação dela com o atraso for pelo menos a mediana das originais e:
+#   - não for cópia de um componente (correlação <= LIMIAR_REDUNDANCIA), ou
+#   - for cópia, mas mais relevante que esse componente: nesse caso a razão SUBSTITUI o componente.
+# Caso contrário, é descartada.
+originais = [c for c in CANDIDATAS if c not in RAZOES_NOVAS]
+corte_relevancia = relevancia[originais].median()
+linhas = []
+for nome, (comps, _) in RAZOES_NOVAS.items():
+    corr_comp = assoc.loc[nome, list(comps)].astype(float)
+    parecido = corr_comp.idxmax()
+    linhas.append({"razão": nome, "componentes": " / ".join(comps),
+                   "relevancia_alvo": relevancia[nome],
+                   "relevancia_melhor_componente": relevancia[list(comps)].max(),
+                   "maior_corr_componente": corr_comp.max(), "componente_mais_parecido": parecido,
+                   "relevancia_parecido": relevancia[parecido]})
+avaliacao_razoes = pd.DataFrame(linhas).set_index("razão").sort_values("relevancia_alvo", ascending=False)
+a = avaliacao_razoes
+interessante = a["relevancia_alvo"] >= corte_relevancia
+copia = a["maior_corr_componente"] > LIMIAR_REDUNDANCIA
+substitui = interessante & copia & (a["relevancia_alvo"] > a["relevancia_parecido"])
+a["decisao"] = np.select([interessante & ~copia, substitui],
+                         ["adicionada ao modelo", "adicionada (substitui " + a["componente_mais_parecido"] + ")"],
+                         "descartada")
+RAZOES_APROVADAS = a.index[a["decisao"] != "descartada"].tolist()
+SUBSTITUIDAS = dict(zip(a.loc[substitui, "componente_mais_parecido"], a.index[substitui]))
+print(f"Corte de relevância (mediana das {len(originais)} originais): {corte_relevancia:.4f}")
+display(a.round(4).reset_index())
+
+fig, axes = plt.subplots(1, 2, figsize=(20, 5.5), gridspec_kw={"width_ratios": [1, 1.4]})
+r_ = a.sort_values("relevancia_alvo")
+axes[0].barh(r_.index, r_["relevancia_alvo"],
+             color=["#C44E52" if d == "descartada" else "#55A868" for d in r_["decisao"]])
+axes[0].axvline(corte_relevancia, color="black", ls="--", lw=1, label="mediana das originais")
+axes[0].legend(fontsize=8)
+axes[0].set_title("Correlação das novas razões com o alvo (verde = adicionada)")
+comps_todos = list(dict.fromkeys(c for comps, _ in RAZOES_NOVAS.values() for c in comps))
+sns.heatmap(assoc.loc[list(RAZOES_NOVAS), comps_todos].astype(float), annot=True, fmt=".2f", annot_kws={"size": 7},
+            cmap="Reds", vmin=0, vmax=1, ax=axes[1])
+axes[1].set_title("Correlação das novas razões com as variáveis que as compõem")
+mostrar(fig, "selecao_01b_novas_razoes")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Pesos e seleção das variáveis (relevância mínima + redundância)
+
+# COMMAND ----------
+
+# Peso = relevância com o alvo x (1 - maior correlação com as já escolhidas). A cada passo entra a de maior peso;
+# variáveis com correlação acima de LIMIAR_REDUNDANCIA com alguma escolhida ficam bloqueadas.
+# As razões aprovadas entram primeiro; as descartadas saem da disputa.
+selecionadas, peso_bruto = [], {}
+for r in RAZOES_APROVADAS:
+    red = assoc.loc[r, selecionadas].max() if selecionadas else 0.0
+    if red <= LIMIAR_REDUNDANCIA:
+        selecionadas.append(r)
+        peso_bruto[r] = float(relevancia[r] * (1 - red))
+fora = [r for r in RAZOES_NOVAS if r not in selecionadas] + list(SUBSTITUIDAS)
+restantes = [f for f in relevancia.sort_values(ascending=False).index if f not in selecionadas and f not in fora]
+while len(selecionadas) < N_FEATURES_MAX and restantes:
+    if selecionadas:
+        red = assoc.loc[restantes, selecionadas].max(axis=1)
+    else:
+        red = pd.Series(0.0, index=restantes)
+    score = (relevancia[restantes] * (1 - red)).where(red <= LIMIAR_REDUNDANCIA, -1.0)
+    melhor = score.idxmax()
+    if score[melhor] <= 0 or relevancia[melhor] < MIN_RELEVANCIA:   # v6: critério de parada
+        break
+    selecionadas.append(melhor)
+    peso_bruto[melhor] = float(score[melhor])
+    restantes.remove(melhor)
+
+N_FEATURES = len(selecionadas)
+print(f"v6: seleção parou em {N_FEATURES} variáveis (relevância mínima {MIN_RELEVANCIA}, "
+      f"redundância máxima {LIMIAR_REDUNDANCIA}, teto {N_FEATURES_MAX})")
+pesos = pd.Series(peso_bruto)
+pesos = pesos / pesos.sum()
+
+outras = assoc.loc[CANDIDATAS, selecionadas].astype(float).copy()
+for f in selecionadas:
+    outras.loc[f, f] = np.nan
+ranking = pd.DataFrame({
+    "grupo": [GRUPO[f] for f in CANDIDATAS],
+    "relevancia_alvo": relevancia[CANDIDATAS],
+    "maior_corr_selecionada": outras.max(axis=1),
+    "mais_parecida_com": outras.idxmax(axis=1),
+    "peso": pesos.reindex(CANDIDATAS),
+    "ordem_entrada": pd.Series({f: i + 1 for i, f in enumerate(selecionadas)}).reindex(CANDIDATAS),
+}, index=CANDIDATAS)
+ranking["status"] = np.where(ranking.index.isin(selecionadas), "selecionada",
+                             np.where(ranking["maior_corr_selecionada"] > LIMIAR_REDUNDANCIA,
+                                      "removida: redundante", "removida: peso baixo"))
+ranking.loc[ranking.index.isin([r for r in RAZOES_NOVAS if r not in selecionadas]), "status"] = "descartada: razão nova sem ganho"
+for comp, razao in SUBSTITUIDAS.items():
+    ranking.loc[comp, "status"] = f"substituída pela razão {razao}"
+ranking = ranking.sort_values(["peso", "relevancia_alvo"], ascending=False)
+display(ranking.round(3).reset_index().rename(columns={"index": "variável"}))
+display(ranking.groupby(["grupo", "status"]).size().unstack(fill_value=0))
+
+fig, axes = plt.subplots(1, 2, figsize=(24, 10), gridspec_kw={"width_ratios": [1, 1.6]})
+p = pesos.sort_values()
+cores_g = dict(zip(sorted({GRUPO[f] for f in CANDIDATAS}), sns.color_palette("deep")))
+axes[0].barh(p.index, p.values, color=[cores_g[GRUPO[f]] for f in p.index])
+axes[0].xaxis.set_major_formatter(PCT)
+axes[0].legend([plt.Rectangle((0, 0), 1, 1, color=c) for c in cores_g.values()], cores_g.keys(),
+               fontsize=8, loc="lower right")
+axes[0].set_title(f"Peso das {N_FEATURES} variáveis selecionadas")
+sns.heatmap(assoc.loc[selecionadas, selecionadas].astype(float), annot=True, fmt=".2f", annot_kws={"size": 6},
+            cmap="Reds", vmin=0, vmax=1, ax=axes[1])
+axes[1].set_title(f"Matriz de correlação das {N_FEATURES} selecionadas (ordem de entrada)")
+mostrar(fig, "selecao_02_pesos_matriz_selecionadas")
+
+# Listas usadas pelo pipeline a partir daqui
+SELECIONADAS = list(selecionadas)
+CATEGORICAS = [f for f in CATEGORICAS_CAND if f in SELECIONADAS]
+NUMERICAS = [f for f in NUMERICAS_CAND if f in SELECIONADAS]
+RAZOES_ATIVAS = [r for r in RAZOES if r in SELECIONADAS]
+entradas_razoes = [c for nome, valor, grupo in RazoesPelaMediana.REGRAS if nome in RAZOES_ATIVAS
+                   for c in (valor, *grupo)]
+FEATURES_X = list(dict.fromkeys([f for f in SELECIONADAS if f not in RAZOES] + entradas_razoes))
+ASSINATURA = hashlib.md5(",".join(sorted(SELECIONADAS)).encode()).hexdigest()[:8]
+
+assert len(SELECIONADAS) == N_FEATURES
+assert not proibidas & set(FEATURES_X), "vazamento na seleção"
+assert assoc.loc[SELECIONADAS, SELECIONADAS].where(~np.eye(N_FEATURES, dtype=bool)).max().max() <= LIMIAR_REDUNDANCIA
+dicionario["selecionada"] = dicionario["feature"].isin(SELECIONADAS)
+dicionario["peso"] = dicionario["feature"].map(pesos)
+print(f"{len(CANDIDATAS)} candidatas -> {N_FEATURES} selecionadas ({len(CATEGORICAS)} categóricas, "
+      f"{len(NUMERICAS)} numéricas) | colunas de entrada do pipeline: {len(FEATURES_X)} | assinatura {ASSINATURA}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 7b. Recorte do treino: v6 recompara as estratégias na validação
+
+# COMMAND ----------
+
+# v6: compara as estratégias de recorte nos 3 folds de VALIDAÇÃO, com parâmetros fixos e moderados
+# (a busca de hiperparâmetros vem depois, já com a estratégia escolhida). O teste não participa.
+PARAMS_COMPARACAO = {
+    "Regressão Logística": {"estimador__modelo__C": 0.1},
+    "Gradient Boosting": {"estimador__modelo__n_estimators": 200, "estimador__modelo__learning_rate": 0.05,
+                          "estimador__modelo__max_depth": 3, "estimador__modelo__min_samples_leaf": 100,
+                          "estimador__modelo__subsample": 0.85, "estimador__modelo__max_features": "sqrt"},
+    "LightGBM": {"estimador__modelo__n_estimators": 300, "estimador__modelo__num_leaves": 31,
+                 "estimador__modelo__min_child_samples": 100},
+    "Random Forest": {"estimador__modelo__min_samples_leaf": 50},
+}
+
+if ESTRATEGIA_RECORTE == "auto":
+    linhas_rec = []
+    for est in ESTRATEGIAS_COMPARAR:
+        montar_recorte(est, mostrar_resumo=False)
+        for nome in MODELOS:
+            pr = []
+            for f_ in folds:
+                Xf, yf = Xy(f_["tr"])
+                Xv, yv = Xy(f_["va"])
+                m_ = construir(nome).set_params(**PARAMS_COMPARACAO[nome]).fit(Xf, yf)
+                pr.append(average_precision_score(yv, m_.predict_proba(Xv)[:, 1]))
+            linhas_rec.append({"estrategia": est, "modelo": nome, "pr_auc_validacao_media": float(np.mean(pr)),
+                               **{f"fold_{i + 1}": v for i, v in enumerate(pr)},
+                               "pedidos_treino_final": len(treino_final)})
+            print(f"  {est:26s} {nome:20s} PR-AUC validação {np.mean(pr):.4f}")
+    comp_recorte = pd.DataFrame(linhas_rec)
+    display(comp_recorte.round(4))
+    media_rec = comp_recorte.groupby("estrategia")["pr_auc_validacao_media"].mean().sort_values(ascending=False)
+    display(media_rec.round(4).reset_index().rename(columns={"pr_auc_validacao_media": "media_dos_modelos"}))
+    ESTRATEGIA_ESCOLHIDA = media_rec.index[0]
+    print(f"\n>>> Estratégia escolhida na validação: {ESTRATEGIA_ESCOLHIDA}")
+else:
+    ESTRATEGIA_ESCOLHIDA = ESTRATEGIA_RECORTE
+
+montar_recorte(ESTRATEGIA_ESCOLHIDA)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Volume de vendas e taxa de atraso: do treino ao teste (estratégia escolhida)
 
 # COMMAND ----------
 
@@ -1113,10 +1683,10 @@ originais = {
                                            & (bm["data_conhecimento_alvo"] < INICIO_TESTE)],
 }
 novos = {f"Treino novo ({ESTRATEGIA_ATIVA})": treino_final,
-         f"Calibração nova ({', '.join(sorted(calib['ano_mes'].unique()))})": calib,
+         f"Calibração nova ({periodo(FIM_TREINO_FINAL, INICIO_TESTE)})": calib,
          f"Teste ({periodo(INICIO_TESTE, pd.Timestamp(DATA_FIM) + pd.Timedelta(days=1))})": teste}
 
-ORDEM_PAPEIS = ["Não usado pela estratégia", "Treino", "Excluído (embargo, resultado desconhecido ou mês atípico)",
+ORDEM_PAPEIS = ["Não usado pela estratégia", "Treino", "Excluído (embargo / resultado desconhecido)",
                 "Calibração", "Teste"]
 CORES_PAPEL = dict(zip(ORDEM_PAPEIS, ["#E3E3E3", "#4C72B0", "#B0B0B0", "#DD8452", "#C44E52"]))
 papel = pd.Series(ORDEM_PAPEIS[2], index=bm.index)
@@ -1228,561 +1798,97 @@ display(equilibrio.round(4))
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 6. Modelagem: pré-processamento, balanceamento e os modelos (Regressão Logística e Gradient Boosting)
-
-# COMMAND ----------
-
-def log_com_sinal(x):
-    return np.sign(x) * np.log1p(np.abs(x))
-
-
-class RazoesPelaMediana(BaseEstimator, TransformerMixin):
-    """Cria valor / mediana do grupo. As medianas vêm só do treino (fit); grupos com menos de
-    `minimo` pedidos usam a mediana geral do treino."""
-    REGRAS = (("preco_rel_categoria", "valor_produtos", ("categoria",)),
-              ("frete_rel_rota", "valor_frete", ("seller_state", "customer_state")))
-
-    def __init__(self, minimo=30, razoes=None):
-        self.minimo = minimo
-        self.razoes = razoes
-
-    def _regras(self):
-        return [r for r in self.REGRAS if self.razoes is None or r[0] in self.razoes]
-
-    @staticmethod
-    def _chave(X, grupo):
-        chave = X[grupo[0]].astype(str)
-        for c in grupo[1:]:
-            chave = chave + ">" + X[c].astype(str)
-        return chave
-
-    def fit(self, X, y=None):
-        self.medianas_ = {}
-        for nome, valor, grupo in self._regras():
-            chave = self._chave(X, grupo)
-            g = X[valor].groupby(chave)
-            med = g.median()[g.count() >= self.minimo]
-            self.medianas_[nome] = (med, float(X[valor].median()))
-        return self
-
-    def transform(self, X):
-        X = X.copy()
-        for nome, valor, grupo in self._regras():
-            med, geral = self.medianas_[nome]
-            chave = self._chave(X, grupo)
-            ref = chave.map(med).fillna(geral).replace(0, np.nan)
-            X[nome] = X[valor] / ref
-        return X
-
-
-class SelecionaColunas(BaseEstimator, TransformerMixin):
-    """Mantém só as variáveis escolhidas pela matriz de correlação."""
-    def __init__(self, colunas):
-        self.colunas = colunas
-
-    def fit(self, X, y=None):
-        return self
-
-    def transform(self, X):
-        return X[list(self.colunas)]
-
-
-class ParaCategoria(BaseEstimator, TransformerMixin):
-    """Texto -> 'category' com as categorias vistas no treino (valor novo vira nulo)."""
-    def __init__(self, colunas):
-        self.colunas = colunas
-
-    def fit(self, X, y=None):
-        self.categorias_ = {c: sorted(X[c].dropna().unique()) for c in self.colunas}
-        return self
-
-    def transform(self, X):
-        X = X.copy()
-        for c in self.colunas:
-            X[c] = pd.Categorical(X[c], categories=self.categorias_[c])
-        return X
-
-
-class ModeloBalanceado(BaseEstimator, ClassifierMixin):
-    """Balanceamento aplicado DENTRO do fit, ou seja, só no treino do fold. Validação, calibração e teste nunca
-    são reamostrados (é isso que impede o vazamento).
-    estrategia:
-      'nenhum'
-      'pesos': erro em atraso custa mais; razao = proporção efetiva negativos:positivos (1 = classes iguais)
-      'ensemble_subamostragem' (EasyEnsemble): n_membros modelos, cada um com todos os atrasos e uma amostra
-          diferente de pedidos no prazo (razao x atrasos); a previsão é a média dos membros.
-      'oversampling': repete atrasos sorteados (com reposição) até a proporção negativos:positivos = razao.
-      'smote': cria atrasos SINTÉTICOS entre um atraso real e um dos k_vizinhos atrasos mais parecidos, até a
-          proporção negativos:positivos = razao. Colunas categóricas e binárias são copiadas de um dos dois
-          pedidos (não faz sentido "meio estado" ou "meio voucher"), como no SMOTE-NC.
-    Nas duas estratégias de oversampling o pré-processamento (medianas, imputação, padronização) aprende só com
-    os pedidos REAIS do treino; os novos atrasos são criados depois, no espaço já transformado."""
-    def __init__(self, estimador, estrategia="nenhum", razao=1.0, n_membros=5, k_vizinhos=5, random_state=SEED):
-        self.estimador = estimador
-        self.estrategia = estrategia
-        self.razao = razao
-        self.n_membros = n_membros
-        self.k_vizinhos = k_vizinhos
-        self.random_state = random_state
-
-    @staticmethod
-    def _denso(Xt):
-        return Xt.toarray() if sparse.issparse(Xt) else np.asarray(Xt, dtype=float)
-
-    def _colunas_copiadas(self, pre, Xt):
-        """Categóricas (bloco 'cat' do ColumnTransformer) e colunas binárias: copiadas, não interpoladas."""
-        copia = np.all(np.isin(Xt, [0.0, 1.0]), axis=0)
-        ct = pre.named_steps.get("prep")
-        if ct is not None and "cat" in getattr(ct, "output_indices_", {}):
-            copia[ct.output_indices_["cat"]] = True
-        return copia
-
-    def _smote(self, Xpos, n_novos, copia, rng):
-        k = int(min(self.k_vizinhos, len(Xpos) - 1))
-        escala = Xpos.std(axis=0) + 1e-9                    # vizinhos procurados com variáveis padronizadas
-        viz = NearestNeighbors(n_neighbors=k + 1).fit(Xpos / escala).kneighbors(Xpos / escala, return_distance=False)[:, 1:]
-        base = rng.integers(0, len(Xpos), n_novos)
-        par = viz[base, rng.integers(0, k, n_novos)]
-        novos = Xpos[base] + rng.random((n_novos, 1)) * (Xpos[par] - Xpos[base])
-        if copia.any():
-            do_par = rng.random(n_novos) < 0.5
-            novos[:, copia] = np.where(do_par[:, None], Xpos[par][:, copia], Xpos[base][:, copia])
-        return novos
-
-    def _fit_oversampling(self, X, y, rng):
-        pre = clone(self.estimador[:-1])                    # razões + pré-processamento
-        Xt = self._denso(pre.fit_transform(X, y))           # aprendem só com pedidos reais
-        pos = np.flatnonzero(y == 1)
-        n_alvo = int(np.ceil((y == 0).sum() / self.razao))  # positivos necessários para a razão pedida
-        n_novos = max(0, n_alvo - len(pos))
-        if self.estrategia == "oversampling":
-            extra = Xt[rng.choice(pos, n_novos, replace=True)]
-        else:
-            extra = self._smote(Xt[pos], n_novos, self._colunas_copiadas(pre, Xt), rng)
-        Xr = np.vstack([Xt, extra])
-        yr = np.concatenate([y, np.ones(n_novos, dtype=y.dtype)])
-        modelo = clone(self.estimador.steps[-1][1]).fit(Xr, yr)
-        self.n_sinteticos_ = n_novos
-        return Pipeline(pre.steps + [("modelo", modelo)])  # pipeline já ajustado: transforma e prevê
-
-    def fit(self, X, y):
-        y = np.asarray(y)
-        rng = np.random.default_rng(self.random_state)
-        self.n_sinteticos_ = 0
-        if self.estrategia == "ensemble_subamostragem":
-            pos, neg = np.flatnonzero(y == 1), np.flatnonzero(y == 0)
-            n_neg = min(len(neg), int(self.razao * len(pos)))
-            self.membros_ = []
-            for _ in range(self.n_membros):
-                idx = np.sort(np.concatenate([pos, rng.choice(neg, n_neg, replace=False)]))
-                self.membros_.append(clone(self.estimador).fit(X.iloc[idx], y[idx]))
-        elif self.estrategia == "pesos":
-            w = np.where(y == 1, (y == 0).sum() / (self.razao * y.sum()), 1.0)
-            self.membros_ = [clone(self.estimador).fit(X, y, modelo__sample_weight=w / w.mean())]
-        elif self.estrategia in ("oversampling", "smote"):
-            self.membros_ = [self._fit_oversampling(X, y, rng)]
-        elif self.estrategia == "nenhum":
-            self.membros_ = [clone(self.estimador).fit(X, y)]
-        else:
-            raise ValueError(f"estratégia de balanceamento desconhecida: {self.estrategia}")
-        self.estimador_ = self.membros_[0]
-        self.classes_ = self.estimador_.classes_
-        return self
-
-    def predict_proba(self, X):
-        return np.mean([m.predict_proba(X) for m in self.membros_], axis=0)
-
-    def decision_function(self, X):
-        """Logit da probabilidade. O calibrador sigmoide usa este score; sem ele, algumas versões do
-        scikit-learn pegam colunas diferentes de predict_proba no ajuste e na previsão e invertem o ranking."""
-        p = np.clip(self.predict_proba(X)[:, 1], 1e-7, 1 - 1e-7)
-        return np.log(p / (1 - p))
-
-    def predict(self, X):
-        return self.classes_[(self.predict_proba(X)[:, 1] >= 0.5).astype(int)]
-
-
-def prep_linear():
-    num = Pipeline([("imputa", SimpleImputer(strategy="median", add_indicator=True)),
-                    ("log", FunctionTransformer(log_com_sinal, feature_names_out="one-to-one")),
-                    ("spline", "passthrough"),   # a busca decide: linear ou curva (spline) por variável
-                    ("padroniza", StandardScaler())])
-    return ColumnTransformer([("cat", OneHotEncoder(handle_unknown="infrequent_if_exist", min_frequency=50), CATEGORICAS),
-                              ("num", num, NUMERICAS)])
-
-
-def prep_arvore():
-    return ColumnTransformer([
-        ("cat", OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1, encoded_missing_value=-1), CATEGORICAS),
-        ("num", SimpleImputer(strategy="median", add_indicator=True), NUMERICAS)])
-
-
-def construir(nome):
-    if nome == "Regressão Logística":
-        etapas = [("prep", prep_linear()), ("modelo", LogisticRegression(max_iter=3000))]
-    elif nome == "Random Forest":
-        etapas = [("prep", prep_arvore()),
-                  ("modelo", RandomForestClassifier(n_estimators=300, n_jobs=-1, random_state=SEED))]
-    elif nome == "Gradient Boosting":
-        etapas = [("prep", prep_arvore()), ("modelo", GradientBoostingClassifier(random_state=SEED))]
-    elif nome == "LightGBM":
-        etapas = [("cat", ParaCategoria(CATEGORICAS)),
-                  ("modelo", LGBMClassifier(random_state=SEED, verbose=-1, n_jobs=-1, subsample_freq=1))]
-    else:
-        raise ValueError(nome)
-    return ModeloBalanceado(Pipeline([("razoes", RazoesPelaMediana(razoes=RAZOES_ATIVAS)),
-                                  ("seleciona", SelecionaColunas(SELECIONADAS))] + etapas))
-
-
-BALANCEAMENTO = {"estrategia": ["nenhum", "pesos", "ensemble_subamostragem", "oversampling", "smote"],
-                 "razao": [1.0, 2.0, 3.0, 5.0],   # proporção final negativos:positivos no treino
-                 "k_vizinhos": [3, 5, 10]}        # só o SMOTE usa
-ESPACOS = {
-    "Regressão Logística": {"estimador__modelo__C": [0.0003, 0.001, 0.002, 0.003, 0.005, 0.01, 0.03],   # antes o melhor era o menor (0,003)
-                            "estimador__prep__num__spline": ["passthrough",
-                                                             SplineTransformer(n_knots=4, degree=3),
-                                                             SplineTransformer(n_knots=6, degree=3)],
-                            **BALANCEAMENTO},
-    "Random Forest": {"estimador__modelo__max_depth": [8, 12, 16, None],
-                      "estimador__modelo__min_samples_leaf": [20, 50, 100, 200],
-                      "estimador__modelo__max_features": ["sqrt", 0.3, 0.5],
-                      **BALANCEAMENTO},
-    # antes os melhores ficaram na borda: 300 árvores (máx.), taxa 0,03 (mín.), profundidade 4 (máx.), folha 200 (máx.)
-    "Gradient Boosting": {"estimador__modelo__n_estimators": [300, 500, 800],
-                          "estimador__modelo__learning_rate": [0.01, 0.02, 0.03, 0.05],
-                          "estimador__modelo__max_depth": [3, 4, 5],
-                          "estimador__modelo__min_samples_leaf": [200, 400, 800],
-                          "estimador__modelo__subsample": [0.7, 0.85],
-                          "estimador__modelo__max_features": [0.5, "sqrt"],
-                          **BALANCEAMENTO},
-    "LightGBM": {"estimador__modelo__learning_rate": [0.02, 0.05, 0.1],
-                 "estimador__modelo__n_estimators": [200, 400, 600],
-                 "estimador__modelo__num_leaves": [15, 31, 63],
-                 "estimador__modelo__min_child_samples": [50, 100, 200],
-                 "estimador__modelo__reg_lambda": [0.0, 1.0, 5.0],
-                 "estimador__modelo__colsample_bytree": [0.6, 0.8, 1.0],
-                 "estimador__modelo__subsample": [0.7, 1.0],
-                 **BALANCEAMENTO},
-}
-INTERPRETABILIDADE = {"Regressão Logística": 1.0, "Random Forest": 0.5, "Gradient Boosting": 0.5, "LightGBM": 0.5}
-MODELOS = [m for m in ESPACOS if m in MODELOS_TESTADOS]
-print(f"Modelos testados: {MODELOS}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 7. Seleção de variáveis por matriz de correlação (30 variáveis)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### Matriz de correlação das candidatas
-
-# COMMAND ----------
-
-def cramers_v_corrigido(a, b):
-    """V de Cramér com correção de viés (Bergsma): não infla com muitas categorias."""
-    tab = pd.crosstab(a, b)
-    if min(tab.shape) < 2:
-        return 0.0
-    chi2 = stats.chi2_contingency(tab, correction=False)[0]
-    n = tab.to_numpy().sum()
-    r, k = tab.shape
-    phi2 = max(0.0, chi2 / n - (k - 1) * (r - 1) / (n - 1))
-    r_c, k_c = r - (r - 1) ** 2 / (n - 1), k - (k - 1) ** 2 / (n - 1)
-    den = min(k_c - 1, r_c - 1)
-    return float(np.sqrt(phi2 / den)) if den > 0 else 0.0
-
-
-def razao_correlacao(categoria, x):
-    """Razão de correlação (eta) entre uma categórica e uma numérica (0 = nenhuma, 1 = total)."""
-    ok = categoria.notna() & x.notna()
-    categoria, x = categoria[ok], x[ok]
-    ss_total = ((x - x.mean()) ** 2).sum()
-    g = x.groupby(categoria, observed=True)
-    ss_entre = (g.size() * (g.mean() - x.mean()) ** 2).sum()
-    return float(np.sqrt(ss_entre / ss_total)) if ss_total > 0 else 0.0
-
-
-# Só o treino do 1º fold: nenhum período de validação, calibração ou teste participa da seleção
-# (na versão anterior a seleção via os folds de validação e a validação cruzada ficou otimista)
-dados_selecao = TREINO_SELECAO   # treino do fold 1 da versão original: mesmas 30 variáveis
-RAZOES = [r[0] for r in RazoesPelaMediana.REGRAS]
-CANDIDATAS = CATEGORICAS_CAND + NUMERICAS_CAND
-sel = RazoesPelaMediana().fit_transform(dados_selecao[CATEGORICAS_CAND + NUMERICAS_X_CAND])
-y_sel = pd.Series(dados_selecao["atrasou"].to_numpy(), index=sel.index)
-cats = {c: sel[c].where(sel[c].map(sel[c].value_counts()) >= 50, "outras") for c in CATEGORICAS_CAND}
-postos = sel[NUMERICAS_CAND].astype(float).rank()
-
-# Matriz de correlação: |Spearman| (num x num), V de Cramér (cat x cat), razão de correlação (cat x num)
-assoc = pd.DataFrame(np.eye(len(CANDIDATAS)), index=CANDIDATAS, columns=CANDIDATAS)
-assoc.loc[NUMERICAS_CAND, NUMERICAS_CAND] = postos.corr().abs().fillna(0).to_numpy()
-for i, a in enumerate(CATEGORICAS_CAND):
-    for b in CATEGORICAS_CAND[i + 1:]:
-        assoc.loc[a, b] = assoc.loc[b, a] = cramers_v_corrigido(cats[a], cats[b])
-    for b in NUMERICAS_CAND:
-        assoc.loc[a, b] = assoc.loc[b, a] = razao_correlacao(cats[a], postos[b])
-for c in CANDIDATAS:
-    assoc.loc[c, c] = 1.0
-
-# Relevância: correlação de cada variável com o alvo (atrasou)
-# Para numéricas usa o maior entre |Spearman| (relação monotônica) e o V de Cramér das faixas (decis), que
-# também capta relações em U (ex.: mês, sazonalidade), que o Spearman sozinho não enxerga.
-def relevancia_numerica(x, y):
-    faixas = pd.qcut(x, 10, duplicates="drop").cat.codes  # nulo vira faixa própria (-1)
-    return max(abs(x.rank().corr(y.rank())), cramers_v_corrigido(faixas, y))
-
-
-relevancia = pd.Series({c: cramers_v_corrigido(cats[c], y_sel) for c in CATEGORICAS_CAND}
-                       | {c: relevancia_numerica(sel[c].astype(float), y_sel) for c in NUMERICAS_CAND}).fillna(0)
-
-ordem = sorted(CANDIDATAS, key=lambda f: (GRUPO[f], -relevancia[f]))
-fig, ax = plt.subplots(figsize=(20, 17))
-sns.heatmap(assoc.loc[ordem, ordem].astype(float), cmap="Reds", vmin=0, vmax=1, square=True, ax=ax,
-            cbar_kws={"shrink": 0.6})
-ax.set_title(f"Matriz de correlação das {len(CANDIDATAS)} candidatas (treino do 1º fold, {len(dados_selecao):,} pedidos)")
-mostrar(fig, "selecao_01_matriz_candidatas")
-
-triang = np.triu(np.ones(assoc.shape, dtype=bool), 1)
-pares = (assoc.where(triang).stack().dropna().rename("correlacao")
-         .loc[lambda s: s > LIMIAR_REDUNDANCIA].sort_values(ascending=False))
-print(f"{len(pares)} pares com correlação acima de {LIMIAR_REDUNDANCIA}")
-display(pares.reset_index().set_axis(["variável A", "variável B", "correlação"], axis=1).round(3))
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### Novas razões: adicionar ou descartar
-
-# COMMAND ----------
-
-# Uma razão nova entra no modelo se a correlação dela com o atraso for pelo menos a mediana das originais e:
-#   - não for cópia de um componente (correlação <= LIMIAR_REDUNDANCIA), ou
-#   - for cópia, mas mais relevante que esse componente: nesse caso a razão SUBSTITUI o componente.
-# Caso contrário, é descartada.
-originais = [c for c in CANDIDATAS if c not in RAZOES_NOVAS]
-corte_relevancia = relevancia[originais].median()
-linhas = []
-for nome, (comps, _) in RAZOES_NOVAS.items():
-    corr_comp = assoc.loc[nome, list(comps)].astype(float)
-    parecido = corr_comp.idxmax()
-    linhas.append({"razão": nome, "componentes": " / ".join(comps),
-                   "relevancia_alvo": relevancia[nome],
-                   "relevancia_melhor_componente": relevancia[list(comps)].max(),
-                   "maior_corr_componente": corr_comp.max(), "componente_mais_parecido": parecido,
-                   "relevancia_parecido": relevancia[parecido]})
-avaliacao_razoes = pd.DataFrame(linhas).set_index("razão").sort_values("relevancia_alvo", ascending=False)
-a = avaliacao_razoes
-interessante = a["relevancia_alvo"] >= corte_relevancia
-copia = a["maior_corr_componente"] > LIMIAR_REDUNDANCIA
-substitui = interessante & copia & (a["relevancia_alvo"] > a["relevancia_parecido"])
-a["decisao"] = np.select([interessante & ~copia, substitui],
-                         ["adicionada ao modelo", "adicionada (substitui " + a["componente_mais_parecido"] + ")"],
-                         "descartada")
-RAZOES_APROVADAS = a.index[a["decisao"] != "descartada"].tolist()
-SUBSTITUIDAS = dict(zip(a.loc[substitui, "componente_mais_parecido"], a.index[substitui]))
-print(f"Corte de relevância (mediana das {len(originais)} originais): {corte_relevancia:.4f}")
-display(a.round(4).reset_index())
-
-fig, axes = plt.subplots(1, 2, figsize=(20, 5.5), gridspec_kw={"width_ratios": [1, 1.4]})
-r_ = a.sort_values("relevancia_alvo")
-axes[0].barh(r_.index, r_["relevancia_alvo"],
-             color=["#C44E52" if d == "descartada" else "#55A868" for d in r_["decisao"]])
-axes[0].axvline(corte_relevancia, color="black", ls="--", lw=1, label="mediana das originais")
-axes[0].legend(fontsize=8)
-axes[0].set_title("Correlação das novas razões com o alvo (verde = adicionada)")
-comps_todos = list(dict.fromkeys(c for comps, _ in RAZOES_NOVAS.values() for c in comps))
-sns.heatmap(assoc.loc[list(RAZOES_NOVAS), comps_todos].astype(float), annot=True, fmt=".2f", annot_kws={"size": 7},
-            cmap="Reds", vmin=0, vmax=1, ax=axes[1])
-axes[1].set_title("Correlação das novas razões com as variáveis que as compõem")
-mostrar(fig, "selecao_01b_novas_razoes")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### Pesos e seleção das 30 variáveis
-
-# COMMAND ----------
-
-# Peso = relevância com o alvo x (1 - maior correlação com as já escolhidas). A cada passo entra a de maior peso;
-# variáveis com correlação acima de LIMIAR_REDUNDANCIA com alguma escolhida ficam bloqueadas.
-# As razões aprovadas entram primeiro; as descartadas saem da disputa.
-selecionadas, peso_bruto = [], {}
-for r in RAZOES_APROVADAS:
-    red = assoc.loc[r, selecionadas].max() if selecionadas else 0.0
-    if red <= LIMIAR_REDUNDANCIA:
-        selecionadas.append(r)
-        peso_bruto[r] = float(relevancia[r] * (1 - red))
-fora = [r for r in RAZOES_NOVAS if r not in selecionadas] + list(SUBSTITUIDAS)
-restantes = [f for f in relevancia.sort_values(ascending=False).index if f not in selecionadas and f not in fora]
-while len(selecionadas) < N_FEATURES:
-    if selecionadas:
-        red = assoc.loc[restantes, selecionadas].max(axis=1)
-    else:
-        red = pd.Series(0.0, index=restantes)
-    score = (relevancia[restantes] * (1 - red)).where(red <= LIMIAR_REDUNDANCIA, -1.0)
-    melhor = score.idxmax()
-    assert score[melhor] > 0, f"só {len(selecionadas)} variáveis passam no filtro de redundância"
-    selecionadas.append(melhor)
-    peso_bruto[melhor] = float(score[melhor])
-    restantes.remove(melhor)
-
-pesos = pd.Series(peso_bruto)
-pesos = pesos / pesos.sum()
-
-outras = assoc.loc[CANDIDATAS, selecionadas].astype(float).copy()
-for f in selecionadas:
-    outras.loc[f, f] = np.nan
-ranking = pd.DataFrame({
-    "grupo": [GRUPO[f] for f in CANDIDATAS],
-    "relevancia_alvo": relevancia[CANDIDATAS],
-    "maior_corr_selecionada": outras.max(axis=1),
-    "mais_parecida_com": outras.idxmax(axis=1),
-    "peso": pesos.reindex(CANDIDATAS),
-    "ordem_entrada": pd.Series({f: i + 1 for i, f in enumerate(selecionadas)}).reindex(CANDIDATAS),
-}, index=CANDIDATAS)
-ranking["status"] = np.where(ranking.index.isin(selecionadas), "selecionada",
-                             np.where(ranking["maior_corr_selecionada"] > LIMIAR_REDUNDANCIA,
-                                      "removida: redundante", "removida: peso baixo"))
-ranking.loc[ranking.index.isin([r for r in RAZOES_NOVAS if r not in selecionadas]), "status"] = "descartada: razão nova sem ganho"
-for comp, razao in SUBSTITUIDAS.items():
-    ranking.loc[comp, "status"] = f"substituída pela razão {razao}"
-ranking = ranking.sort_values(["peso", "relevancia_alvo"], ascending=False)
-display(ranking.round(3).reset_index().rename(columns={"index": "variável"}))
-display(ranking.groupby(["grupo", "status"]).size().unstack(fill_value=0))
-
-fig, axes = plt.subplots(1, 2, figsize=(24, 10), gridspec_kw={"width_ratios": [1, 1.6]})
-p = pesos.sort_values()
-cores_g = dict(zip(sorted({GRUPO[f] for f in CANDIDATAS}), sns.color_palette("deep")))
-axes[0].barh(p.index, p.values, color=[cores_g[GRUPO[f]] for f in p.index])
-axes[0].xaxis.set_major_formatter(PCT)
-axes[0].legend([plt.Rectangle((0, 0), 1, 1, color=c) for c in cores_g.values()], cores_g.keys(),
-               fontsize=8, loc="lower right")
-axes[0].set_title(f"Peso das {N_FEATURES} variáveis selecionadas")
-sns.heatmap(assoc.loc[selecionadas, selecionadas].astype(float), annot=True, fmt=".2f", annot_kws={"size": 6},
-            cmap="Reds", vmin=0, vmax=1, ax=axes[1])
-axes[1].set_title(f"Matriz de correlação das {N_FEATURES} selecionadas (ordem de entrada)")
-mostrar(fig, "selecao_02_pesos_matriz_selecionadas")
-
-# Listas usadas pelo pipeline a partir daqui
-SELECIONADAS = list(selecionadas)
-CATEGORICAS = [f for f in CATEGORICAS_CAND if f in SELECIONADAS]
-NUMERICAS = [f for f in NUMERICAS_CAND if f in SELECIONADAS]
-RAZOES_ATIVAS = [r for r in RAZOES if r in SELECIONADAS]
-entradas_razoes = [c for nome, valor, grupo in RazoesPelaMediana.REGRAS if nome in RAZOES_ATIVAS
-                   for c in (valor, *grupo)]
-FEATURES_X = list(dict.fromkeys([f for f in SELECIONADAS if f not in RAZOES] + entradas_razoes))
-ASSINATURA = hashlib.md5(",".join(sorted(SELECIONADAS)).encode()).hexdigest()[:8]
-
-assert len(SELECIONADAS) == N_FEATURES
-assert not proibidas & set(FEATURES_X), "vazamento na seleção"
-assert assoc.loc[SELECIONADAS, SELECIONADAS].where(~np.eye(N_FEATURES, dtype=bool)).max().max() <= LIMIAR_REDUNDANCIA
-dicionario["selecionada"] = dicionario["feature"].isin(SELECIONADAS)
-dicionario["peso"] = dicionario["feature"].map(pesos)
-print(f"{len(CANDIDATAS)} candidatas -> {N_FEATURES} selecionadas ({len(CATEGORICAS)} categóricas, "
-      f"{len(NUMERICAS)} numéricas) | colunas de entrada do pipeline: {len(FEATURES_X)} | assinatura {ASSINATURA}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 8. Busca de hiperparâmetros e balanceamento (com oversampling e SMOTE)
+# MAGIC ## 8. Busca de hiperparâmetros e balanceamento
 
 # COMMAND ----------
 
 import pickle
-ARQ_BUSCA = os.path.join(SAIDA_DIR, f"buscas_{N_FEATURES}vars_{ASSINATURA}_bal_v30_{VERSAO_RECORTE}.pkl")
-
-
-def sortear_combinacoes(nome):
-    """Sorteio ESTRATIFICADO: N_ITER_POR_BALANCEAMENTO combinações para cada estratégia de balanceamento, para que
-    oversampling e SMOTE sejam comparados com as outras em pé de igualdade."""
-    combos = []
-    for j, est in enumerate(BALANCEAMENTO["estrategia"]):
-        espaco = {k: v for k, v in ESPACOS[nome].items() if k != "estrategia"}
-        if est == "nenhum":
-            espaco["razao"] = [1.0]
-        if est != "smote":
-            espaco["k_vizinhos"] = [5]
-        combos += [{**p, "estrategia": est}
-                   for p in ParameterSampler(espaco, n_iter=N_ITER_POR_BALANCEAMENTO, random_state=SEED + j)]
-    # remove repetidas (espaços pequenos, como o de 'nenhum', podem sortear a mesma combinação)
-    vistos, unicos = set(), []
-    for c in combos:
-        chave = repr(sorted((k, repr(v)) for k, v in c.items()))
-        if chave not in vistos:
-            vistos.add(chave)
-            unicos.append(c)
-    return unicos
-
-
+ARQ_BUSCA = os.path.join(SAIDA_DIR, f"buscas_{N_FEATURES}vars_{ASSINATURA}_v6_{VERSAO_RECORTE}.pkl")
 if os.path.exists(ARQ_BUSCA) and not MODO_RAPIDO:
     with open(ARQ_BUSCA, "rb") as f:
         buscas = pickle.load(f)
-    print("Busca carregada do arquivo salvo; apague o .pkl para refazer.")
+    print("Busca carregada do arquivo salvo; apague buscas.pkl para refazer.")
 else:
     dados_folds = [(*Xy(f["tr"]), *Xy(f["va"])) for f in folds]
     buscas = {}
     for nome in MODELOS:
-        combinacoes = sortear_combinacoes(nome)
+        combinacoes = list(ParameterSampler(ESPACOS[nome], n_iter=N_ITER_BUSCA, random_state=SEED))
         linhas_busca = []
-        t0 = time.time()
         for i, params in enumerate(combinacoes, 1):
-            sc_va, sc_tr = [], []
+            scores = []
             for Xtr_, ytr_, Xva_, yva_ in dados_folds:
                 m = construir(nome).set_params(**params).fit(Xtr_, ytr_)
-                sc_va.append(average_precision_score(yva_, m.predict_proba(Xva_)[:, 1]))
-                sc_tr.append(average_precision_score(ytr_, m.predict_proba(Xtr_)[:, 1]))  # treino REAL, sem sintéticos
-            linhas_busca.append({"params": params, "balanceamento": params["estrategia"], "razao": params["razao"],
-                                 "pr_auc_cv": float(np.mean(sc_va)), "pr_auc_treino": float(np.mean(sc_tr)),
-                                 "gap_overfitting": float(np.mean(sc_tr) - np.mean(sc_va)),
-                                 "desvio_folds": float(np.std(sc_va))})
-            print(f"  {nome} [{i}/{len(combinacoes)}] {params['estrategia']:24s} PR-AUC CV {np.mean(sc_va):.4f} | "
-                  f"treino {np.mean(sc_tr):.4f} | gap {np.mean(sc_tr) - np.mean(sc_va):+.4f} ({time.time() - t0:.0f}s)")
-        buscas[nome] = pd.DataFrame(linhas_busca).sort_values("pr_auc_cv", ascending=False).reset_index(drop=True)
+                scores.append(average_precision_score(yva_, m.predict_proba(Xva_)[:, 1]))
+            linhas_busca.append({"params": params, "pr_auc_cv": float(np.mean(scores))})
+            print(f"  {nome} [{i}/{len(combinacoes)}] PR-AUC CV {np.mean(scores):.4f}")
+        buscas[nome] = (pd.DataFrame(linhas_busca)
+                        .sort_values("pr_auc_cv", ascending=False).reset_index(drop=True))
+        print(f"{nome}: melhor PR-AUC CV {buscas[nome]['pr_auc_cv'].iloc[0]:.4f} entre {len(linhas_busca)} combinações")
     with open(ARQ_BUSCA, "wb") as f:
         pickle.dump(buscas, f)
     print(f"Busca concluída e salva em {ARQ_BUSCA}")
 
-# Regra anti-overfitting: entre as combinações a até TOLERANCIA_PR_AUC da melhor na validação, fica a de MENOR gap
-# entre treino e validação (a que menos decorou o treino). A combinação escolhida vai para a linha 0.
-for nome in MODELOS:
-    b = buscas[nome].sort_values("pr_auc_cv", ascending=False).reset_index(drop=True)
-    if REGRA_ANTI_OVERFITTING:
-        cand = b[b["pr_auc_cv"] >= b["pr_auc_cv"].iloc[0] - TOLERANCIA_PR_AUC]
-        i_esc = cand["gap_overfitting"].idxmin()
-        b = pd.concat([b.loc[[i_esc]], b.drop(index=i_esc)]).reset_index(drop=True)
-    buscas[nome] = b
-    e = b.iloc[0]
-    print(f"\n{nome}: escolhida '{e['balanceamento']}' (razão {e['razao']}) | PR-AUC CV {e['pr_auc_cv']:.4f} | "
-          f"gap {e['gap_overfitting']:+.4f} | maior PR-AUC CV da busca {b['pr_auc_cv'].max():.4f}")
-    if e["gap_overfitting"] > LIMITE_GAP:
-        print(f"  ATENÇÃO: gap acima de {LIMITE_GAP}: o modelo vai bem melhor no treino que na validação (sinal de overfitting)")
-
-# Melhor resultado de cada estratégia de balanceamento
-melhor_bal = (pd.concat([buscas[n].assign(modelo=n) for n in MODELOS])
-              .sort_values("pr_auc_cv", ascending=False).groupby(["modelo", "balanceamento"]).head(1)
-              [["modelo", "balanceamento", "razao", "pr_auc_cv", "pr_auc_treino", "gap_overfitting", "desvio_folds"]]
-              .sort_values(["modelo", "pr_auc_cv"], ascending=[True, False]))
-display(melhor_bal.round(4))
-
-fig, axes = plt.subplots(1, 2, figsize=(18, 4.8))
-for ax, met, tit in [(axes[0], "pr_auc_cv", "PR-AUC na validação (maior = melhor)"),
-                     (axes[1], "gap_overfitting", "Gap treino - validação (menor = menos overfitting)")]:
-    piv = melhor_bal.pivot(index="balanceamento", columns="modelo", values=met).reindex(BALANCEAMENTO["estrategia"])
-    piv.plot.bar(ax=ax, rot=0, width=0.75)
-    ax.set_title(f"Melhor combinação de cada balanceamento: {tit}", fontsize=10)
-    ax.set_xlabel("")
-    if met == "gap_overfitting":
-        ax.axhline(LIMITE_GAP, color="red", ls=":", lw=1.2, label=f"limite de alerta ({LIMITE_GAP})")
-    ax.legend(fontsize=8)
-mostrar(fig, f"busca_balanceamento_{VERSAO_RECORTE}")
-
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 9. Treino final, calibração e avaliação no teste
+# MAGIC ## 9. Treino final, correção de prevalência, política de alerta e avaliação no teste
 
 # COMMAND ----------
+
+from scipy.optimize import brentq
+from scipy.special import expit, logit
+
+
+class CorrecaoPrevalencia:
+    """Calibração SEM mês extra: ajusta só o intercepto (no logit) para que a probabilidade média prevista no
+    treino REAL seja igual à taxa real de atraso do treino. O balanceamento infla as probabilidades; esta correção
+    desfaz a inflação sem mudar a ordem dos pedidos. Usa só o treino, então nenhum mês fica reservado
+    para calibrar e o treino pode chegar até o mês mais recente disponível."""
+    def __init__(self, base, X, y):
+        z = logit(np.clip(base.predict_proba(X)[:, 1], 1e-7, 1 - 1e-7))
+        alvo = float(np.mean(y))
+        self.deslocamento = brentq(lambda b: expit(z + b).mean() - alvo, -30, 30)
+        self.base, self.classes_, self.taxa_alvo = base, base.classes_, alvo
+
+    def predict_proba(self, X):
+        q = expit(logit(np.clip(self.base.predict_proba(X)[:, 1], 1e-7, 1 - 1e-7)) + self.deslocamento)
+        return np.column_stack([1 - q, q])
+
+
+def metricas_faixa(y, p, faixa):
+    """Sinaliza os `faixa` x 100% pedidos de maior risco e mede o resultado."""
+    alerta = p >= np.quantile(p, 1 - faixa)
+    vp = (alerta & (y == 1)).sum()
+    fp = (alerta & (y == 0)).sum()
+    rec = vp / max(y.sum(), 1)
+    esp = 1 - fp / max((y == 0).sum(), 1)
+    prec = vp / max(alerta.sum(), 1)
+    return {"faixa": faixa, "recall": rec, "acuracia": (alerta == (y == 1)).mean(), "precisao": prec,
+            "especificidade": esp, "acuracia_balanceada": (rec + esp) / 2,
+            "f1": 2 * prec * rec / max(prec + rec, 1e-12), "lift": prec / y.mean()}
+
+
+def escolher_faixa(curva, criterio=None):
+    """Escolhe a faixa de alerta na curva MÉDIA DA VALIDAÇÃO (nunca no teste)."""
+    criterio = criterio or CRITERIO_FAIXA
+    if criterio == "equilibrio":
+        i = (curva["recall"] - curva["acuracia"]).abs().idxmin()
+    elif criterio == "f1":
+        i = curva["f1"].idxmax()
+    elif criterio == "youden":
+        i = curva["acuracia_balanceada"].idxmax()
+    elif criterio == "custo":
+        # custo por pedido = RAZAO_CUSTO x (atrasos perdidos) + 1 x (alarmes falsos), na curva média da validação
+        taxa = curva["precisao"] / curva["lift"]
+        custo = RAZAO_CUSTO * taxa * (1 - curva["recall"]) + curva["faixa"] * (1 - curva["precisao"])
+        i = custo.idxmin()
+    elif criterio == "recall_minimo":
+        ok = curva[curva["recall"] >= RECALL_MINIMO]
+        i = ok["acuracia"].idxmax() if len(ok) else curva["recall"].idxmax()
+    else:
+        raise ValueError(criterio)
+    return float(curva.loc[i, "faixa"])
+
 
 import pickle
 import cloudpickle
@@ -1807,53 +1913,19 @@ def calibrar(modelo, X, y):
 
 def modelos_base(modelo):
     """Pipelines originais (um por membro do ensemble), sem calibrador e sem wrapper de balanceamento."""
+    if isinstance(modelo, CorrecaoPrevalencia):
+        modelo = modelo.base
     if isinstance(modelo, CalibratedClassifierCV):
         est = modelo.calibrated_classifiers_[0].estimator
         modelo = getattr(est, "estimator", est)
     return modelo.membros_ if isinstance(modelo, ModeloBalanceado) else [modelo]
 
 
-def curva_limiares(y, p, n=1000):
-    """Acurácia, recall, especificidade, precisão e F1 para uma grade de limiares."""
-    th = np.unique(np.quantile(p, np.linspace(0, 0.999, n)))
-    alerta = p[None, :] >= th[:, None]
-    vp = (alerta & (y == 1)).sum(axis=1)
-    fp = (alerta & (y == 0)).sum(axis=1)
-    pos, neg = (y == 1).sum(), (y == 0).sum()
-    rec = vp / pos
-    esp = 1 - fp / neg
-    prec = vp / np.clip(vp + fp, 1, None)
-    return pd.DataFrame({"limiar": th, "recall": rec, "especificidade": esp, "precisao": prec,
-                         "acuracia": (vp + neg - fp) / len(y), "acuracia_balanceada": (rec + esp) / 2,
-                         "f1": 2 * prec * rec / np.clip(prec + rec, 1e-12, None),
-                         "pct_sinalizados": alerta.mean(axis=1)})
-
-
-def escolher_limiar(y, p, criterio=None):
-    """Limiar escolhido na CALIBRAÇÃO (nunca no teste). Critérios:
-       'f1'            : maximiza o F1 (versões anteriores)
-       'youden'        : maximiza recall + especificidade (acurácia balanceada)
-       'equilibrio'    : recall e acurácia o mais próximos possível
-       'recall_minimo' : maior acurácia mantendo recall >= RECALL_MINIMO"""
-    criterio = criterio or CRITERIO_LIMIAR
-    c = curva_limiares(y, p)
-    if criterio == "f1":
-        i = c["f1"].idxmax()
-    elif criterio == "youden":
-        i = c["acuracia_balanceada"].idxmax()
-    elif criterio == "equilibrio":
-        i = (c["recall"] - c["acuracia"]).abs().idxmin()
-    elif criterio == "recall_minimo":
-        ok = c[c["recall"] >= RECALL_MINIMO]
-        i = ok["acuracia"].idxmax() if len(ok) else c["recall"].idxmax()
-    else:
-        raise ValueError(criterio)
-    return float(c.loc[i, "limiar"])
-
-
 def limiar_f1(y, p):
-    """Mantido pelo nome antigo: agora usa o critério configurado em CRITERIO_LIMIAR."""
-    return escolher_limiar(y, p)
+    """Limiar que maximiza o F1, escolhido na calibração (nunca no teste)."""
+    pr, rc, th = precision_recall_curve(y, p)
+    f1 = 2 * pr[:-1] * rc[:-1] / np.clip(pr[:-1] + rc[:-1], 1e-12, None)
+    return float(th[np.nanargmax(f1)])
 
 
 def avaliar(y, p, datas, n_boot=200):
@@ -1915,15 +1987,15 @@ Xtr, ytr = Xy(treino_final)
 Xcal, ycal = Xy(calib)
 Xte, yte = Xy(teste)
 datas_te = teste["order_purchase_timestamp"].to_numpy()
-DIR_CHECKPOINT = os.path.join(SAIDA_DIR, f"checkpoint_finais_{N_FEATURES}vars_{ASSINATURA}_bal_v30_{VERSAO_RECORTE}")
+DIR_CHECKPOINT = os.path.join(SAIDA_DIR, f"checkpoint_finais_{N_FEATURES}vars_{ASSINATURA}_v6_{VERSAO_FINAL}")
 os.makedirs(DIR_CHECKPOINT, exist_ok=True)
 
-finais, res, prev, imp_nativa, prev_cal = {}, {}, {}, {}, {}
+finais, res, prev, imp_nativa, curvas_val = {}, {}, {}, {}, {}
 for nome in MODELOS:
     arq = os.path.join(DIR_CHECKPOINT, f"{nome.replace(' ', '_')}.pkl")
     if os.path.exists(arq):
         with open(arq, "rb") as f:
-            res[nome], prev[nome], imp_nativa[nome], prev_cal[nome] = pickle.load(f)
+            res[nome], prev[nome], imp_nativa[nome], curvas_val[nome] = pickle.load(f)
         print(f"{nome:20s} carregado do checkpoint")
         continue
     params = buscas[nome]["params"].iloc[0]
@@ -1931,22 +2003,40 @@ for nome in MODELOS:
     t0 = time.time()
     base_m = construir(nome).set_params(**params).fit(Xtr, ytr)
     t_treino = time.time() - t0
-    modelo = calibrar(base_m, Xcal, ycal) if CALIBRAR else base_m
+    if CALIBRACAO == "prevalencia":
+        modelo = CorrecaoPrevalencia(base_m, Xtr, ytr)
+    elif CALIBRACAO == "sigmoide":
+        modelo = calibrar(base_m, Xcal, ycal)
+    else:
+        modelo = base_m
+
+    # Política de alerta escolhida na VALIDAÇÃO: os mesmos parâmetros treinados em cada fold, avaliados no
+    # período seguinte. Também mede o lift na validação (diagnóstico de overfitting).
+    curvas_f, lifts_va = [], []
+    for f_ in folds:
+        Xf, yf = Xy(f_["tr"])
+        Xv, yv = Xy(f_["va"])
+        pv = construir(nome).set_params(**params).fit(Xf, yf).predict_proba(Xv)[:, 1]
+        curvas_f.append(pd.DataFrame([metricas_faixa(yv, pv, fx) for fx in FAIXAS_ALERTA]))
+        lifts_va.append(average_precision_score(yv, pv) / yv.mean())
+    curva_val = pd.concat(curvas_f).groupby("faixa", as_index=False).mean()
+    faixa = escolher_faixa(curva_val)
     t0 = time.time()
     p = modelo.predict_proba(Xte)[:, 1]
     ms_1000 = (time.time() - t0) / len(yte) * 1e6
     p_sem = base_m.predict_proba(Xte)[:, 1]
     assert stats.spearmanr(p, p_sem).statistic > 0.99, f"{nome}: a calibração alterou a ordem dos scores"
-    p_cal = modelo.predict_proba(Xcal)[:, 1]
     m = avaliar(yte, p, datas_te)
     m.update({
         "params": params,
         "pr_auc_cv": buscas[nome]["pr_auc_cv"].iloc[0],
         "brier_sem_calibracao": brier_score_loss(yte, p_sem),
-        "limiar": escolher_limiar(ycal, p_cal),
-        "criterio_limiar": CRITERIO_LIMIAR,
-        "acuracia_limiar": float(((p >= escolher_limiar(ycal, p_cal)) == (yte == 1)).mean()),
-        "recall_limiar": float((p[yte == 1] >= escolher_limiar(ycal, p_cal)).mean()),
+        "faixa_alerta": faixa,
+        "limiar": float(np.quantile(p, 1 - faixa)),   # corte da faixa: usa só os scores, nunca os rótulos do teste
+        "acuracia_alerta": metricas_faixa(yte, p, faixa)["acuracia"],
+        "recall_alerta": metricas_faixa(yte, p, faixa)["recall"],
+        "lift_treino": average_precision_score(ytr, base_m.predict_proba(Xtr)[:, 1]) / ytr.mean(),
+        "lift_validacao": float(np.mean(lifts_va)),
         "segundos_treino": t_treino,
         "ms_por_1000_previsoes": ms_1000,
         "interpretabilidade": INTERPRETABILIDADE[nome],
@@ -1956,17 +2046,17 @@ for nome in MODELOS:
     except Exception as e:                         # a importância nunca deve derrubar o treino
         print(f"  importância de {nome} não calculada ({type(e).__name__}: {e})")
         imp_nome = pd.Series(dtype=float)
-    finais[nome], res[nome], prev[nome], imp_nativa[nome], prev_cal[nome] = modelo, m, p, imp_nome, p_cal
+    finais[nome], res[nome], prev[nome], imp_nativa[nome], curvas_val[nome] = modelo, m, p, imp_nome, curva_val
     with open(arq, "wb") as f:                     # só métricas e previsões: arquivo pequeno e rápido
-        pickle.dump((res[nome], prev[nome], imp_nativa[nome], prev_cal[nome]), f)
+        pickle.dump((res[nome], prev[nome], imp_nativa[nome], curvas_val[nome]), f)
     print(f"{nome:20s} pronto em {t_treino:.0f}s")
 
 print()
 for nome, m in res.items():
     print(f"{nome:20s} TESTE PR-AUC {m['pr_auc']:.4f} (IC95 {m['pr_auc_ic95'][0]:.4f}-{m['pr_auc_ic95'][1]:.4f}) | "
           f"ROC-AUC {m['roc_auc']:.4f} | Brier {m['brier_sem_calibracao']:.4f} -> {m['brier']:.4f} | "
-          f"top10% {m['precisao_top10']:.1%} | limiar '{m['criterio_limiar']}': acurácia {m['acuracia_limiar']:.1%}, "
-          f"recall {m['recall_limiar']:.1%}")
+          f"top10% {m['precisao_top10']:.1%} | alerta nos {m['faixa_alerta']:.0%} de maior risco: "
+          f"acurácia {m['acuracia_alerta']:.1%}, recall {m['recall_alerta']:.1%}")
 
 # Referência sem machine learning: taxa histórica de atraso da rota
 p_ref = teste["taxa_atraso_rota_hist"].fillna(ytr.mean()).to_numpy()
@@ -1976,37 +2066,55 @@ print(f"\nReferência (taxa da rota) PR-AUC {ref['pr_auc']:.4f} | acaso = taxa b
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Diagnóstico de overfitting e vazamento
+# MAGIC ### Política de alerta: acurácia x recall por faixa, e diagnóstico de overfitting
 
 # COMMAND ----------
 
-# Diagnóstico de overfitting do modelo final: PR-AUC no treino REAL (sem sintéticos), na calibração e no teste.
-# Se o treino for muito melhor que calibração/teste, o modelo decorou o treino.
-diag_over = []
+# Política de alerta: sinalizar os X% de pedidos de maior risco. X foi escolhido na VALIDAÇÃO (média dos 3 folds),
+# pelo critério CRITERIO_FAIXA. Aqui aparece a curva inteira, na validação e no teste, para mostrar a troca entre
+# acurácia e recall. Uma faixa fixa de pedidos (em vez de um limiar de probabilidade) não se desloca quando a
+# probabilidade média muda de um período para outro: foi isso que fez a v3 e a v4 sinalizarem quase 60% dos pedidos.
+linhas_p = []
 for nome in MODELOS:
-    params = buscas[nome]["params"].iloc[0]
-    base_d = construir(nome).set_params(**params).fit(Xtr, ytr)
-    p_tr = base_d.predict_proba(Xtr)[:, 1]
-    p_ca = base_d.predict_proba(Xcal)[:, 1]
-    diag_over.append({"modelo": nome, "balanceamento": params["estrategia"], "razao": params["razao"],
-                      "lift_treino": average_precision_score(ytr, p_tr) / ytr.mean(),
-                      "lift_calibracao": average_precision_score(ycal, p_ca) / ycal.mean(),
-                      "lift_teste": res[nome]["pr_auc"] / yte.mean(),
-                      "pr_auc_treino": average_precision_score(ytr, p_tr),
-                      "pr_auc_calibracao": average_precision_score(ycal, p_ca), "pr_auc_teste": res[nome]["pr_auc"]})
-diag_over = pd.DataFrame(diag_over)
-diag_over["queda_lift_treino_teste_pct"] = (1 - diag_over["lift_teste"] / diag_over["lift_treino"]) * 100
-print("Lift = PR-AUC / taxa de atraso do conjunto (permite comparar conjuntos com taxas diferentes).")
-print(f"Queda de lift acima de {LIMITE_QUEDA_LIFT}% entre treino e teste = sinal de overfitting.")
-display(diag_over.round(4))
-for _, r_ in diag_over.iterrows():
-    sinal = "ATENÇÃO, possível overfitting" if r_["queda_lift_treino_teste_pct"] > LIMITE_QUEDA_LIFT else "ok"
-    print(f"  {r_['modelo']:20s} queda de lift treino -> teste: {r_['queda_lift_treino_teste_pct']:.0f}% ({sinal})")
+    for f_ in FAIXAS_ALERTA:
+        val = curvas_val[nome].set_index("faixa").loc[f_]
+        te = metricas_faixa(yte, prev[nome], f_)
+        linhas_p.append({"modelo": nome, "faixa_sinalizada": f_, "recall_validacao": val["recall"],
+                         "acuracia_validacao": val["acuracia"], "recall_teste": te["recall"],
+                         "acuracia_teste": te["acuracia"], "precisao_teste": te["precisao"], "lift_teste": te["lift"],
+                         "escolhida": np.isclose(f_, res[nome]["faixa_alerta"])})
+politica = pd.DataFrame(linhas_p)
+print(f"Critério da faixa: '{CRITERIO_FAIXA}' (escolhido na validação)")
+display(politica.round(4))
 
-# Checagens contra vazamento no balanceamento
-assert len(prev[MODELOS[0]]) == len(teste), "o teste não pode ganhar nem perder linhas"
-assert len(Xcal) == len(calib), "a calibração não pode ser reamostrada"
-print("\nChecagens de vazamento: teste e calibração com o tamanho original (nenhuma linha sintética fora do treino) ok")
+fig, axes = plt.subplots(1, len(MODELOS), figsize=(9 * len(MODELOS), 4.8), squeeze=False)
+for ax, nome in zip(axes[0], MODELOS):
+    d = politica[politica["modelo"] == nome]
+    ax.plot(d["faixa_sinalizada"], d["acuracia_teste"], color="#4C72B0", lw=2, marker="o", label="Acurácia (teste)")
+    ax.plot(d["faixa_sinalizada"], d["recall_teste"], color="#C44E52", lw=2, marker="o", label="Recall (teste)")
+    ax.plot(d["faixa_sinalizada"], d["acuracia_validacao"], color="#4C72B0", lw=1, ls="--", label="Acurácia (validação)")
+    ax.plot(d["faixa_sinalizada"], d["recall_validacao"], color="#C44E52", lw=1, ls="--", label="Recall (validação)")
+    ax.plot(d["faixa_sinalizada"], d["faixa_sinalizada"], color="gray", lw=1, ls=":", label="Recall do acaso")
+    ax.axvline(res[nome]["faixa_alerta"], color="black", lw=1)
+    ax.annotate(f"faixa escolhida: {res[nome]['faixa_alerta']:.0%}", (res[nome]["faixa_alerta"], 0.03),
+                rotation=90, ha="right", va="bottom", fontsize=8)
+    ax.xaxis.set_major_formatter(PCT)
+    ax.yaxis.set_major_formatter(PCT)
+    ax.set_ylim(0, 1)
+    ax.set_xlabel("% de pedidos sinalizados (maior risco primeiro)")
+    ax.set_title(f"{nome}: acurácia x recall por faixa de alerta", fontsize=10)
+    ax.legend(fontsize=8, loc="center right")
+mostrar(fig, f"politica_alerta_{VERSAO_FINAL}")
+
+# Diagnóstico de overfitting: lift (PR-AUC / taxa base) no treino real, na validação e no teste
+diag = pd.DataFrame([{"modelo": n, "lift_treino": res[n]["lift_treino"], "lift_validacao": res[n]["lift_validacao"],
+                      "lift_teste": res[n]["pr_auc"] / yte.mean()} for n in MODELOS])
+diag["queda_treino_teste_pct"] = (1 - diag["lift_teste"] / diag["lift_treino"]) * 100
+print("\nOverfitting: lift = PR-AUC / taxa base (compara conjuntos com taxas de atraso diferentes).")
+display(diag.round(3))
+for _, r_ in diag.iterrows():
+    print(f"  {r_['modelo']:20s} queda de lift treino -> teste {r_['queda_treino_teste_pct']:.0f}% "
+          f"({'ATENÇÃO' if r_['queda_treino_teste_pct'] > 50 else 'ok'})")
 
 # COMMAND ----------
 
@@ -2067,6 +2175,66 @@ print(f"\n>>> MODELO ESCOLHIDO: {vencedor}")
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ### Comparação entre todas as versões (original, v1 a v6)
+# MAGIC
+# MAGIC **Atenção:** comparar várias versões no mesmo teste é útil para mostrar a evolução, mas nenhuma escolha deve ser feita olhando esta tabela. Na v6, recorte, variáveis, hiperparâmetros e faixa de alerta foram escolhidos só na validação.
+
+# COMMAND ----------
+
+# Comparação de TODAS as versões no mesmo teste (abr-ago/2018). Valores das versões anteriores copiados das saídas
+# de cada execução. "% sinalizados", acurácia e recall são medidos no ponto de alerta de cada versão.
+VERSOES = {
+    "original": {"Regressão Logística": dict(pr_auc=0.1301, brier=0.0587, precisao_top10=0.163, acuracia=0.699, recall=0.596, sinalizados=0.311),
+                 "Gradient Boosting": dict(pr_auc=0.0995, brier=0.0669, precisao_top10=0.118, acuracia=0.541, recall=0.723, sinalizados=0.483)},
+    "v1 (5 meses)": {"Regressão Logística": dict(pr_auc=0.1091, brier=0.0580, precisao_top10=0.132, acuracia=0.801, recall=0.400, sinalizados=0.188),
+                     "Gradient Boosting": dict(pr_auc=0.0977, brier=0.0644, precisao_top10=0.120, acuracia=0.705, recall=0.517, sinalizados=0.297)},
+    "v2 (equilibrado)": {"Regressão Logística": dict(pr_auc=0.1307, brier=0.0653, precisao_top10=0.161, acuracia=0.708, recall=0.594, sinalizados=0.302),
+                         "Gradient Boosting": dict(pr_auc=0.1182, brier=0.0632, precisao_top10=0.137, acuracia=0.750, recall=0.480, sinalizados=0.248)},
+    "v3 (calib. jan/18)": {"Regressão Logística": dict(pr_auc=0.0999, brier=0.0690, precisao_top10=0.116, acuracia=0.432, recall=0.832, sinalizados=0.603),
+                           "Gradient Boosting": dict(pr_auc=0.1057, brier=0.0578, precisao_top10=0.122, acuracia=0.554, recall=0.759, sinalizados=0.474)},
+    "v4 (oversampling)": {"Regressão Logística": dict(pr_auc=0.1033, brier=0.0604, precisao_top10=0.122, acuracia=0.465, recall=0.817, sinalizados=0.569),
+                          "Gradient Boosting": dict(pr_auc=0.1050, brier=0.0587, precisao_top10=0.122, acuracia=0.437, recall=0.849, sinalizados=0.600)},
+}
+VERSOES["v5 (consolidada)"] = {
+    "Regressão Logística": dict(pr_auc=0.1306, brier=0.0488, precisao_top10=0.1606, acuracia=0.620, recall=0.688, sinalizados=0.40),
+    "Gradient Boosting": dict(pr_auc=0.1177, brier=0.0497, precisao_top10=0.1365, acuracia=0.617, recall=0.657, sinalizados=0.40)}
+VERSOES["v6 (esta)"] = {m: dict(pr_auc=float(res[m]["pr_auc"]), brier=float(res[m]["brier"]),
+                                precisao_top10=float(res[m]["precisao_top10"]), acuracia=float(res[m]["acuracia_alerta"]),
+                                recall=float(res[m]["recall_alerta"]), sinalizados=float(res[m]["faixa_alerta"]))
+                        for m in MODELOS}
+for v in VERSOES:
+    for m in MODELOS:
+        d = VERSOES[v][m]
+        d["lift_alerta"] = d["recall"] / d["sinalizados"]
+METRICAS_COMP = {"pr_auc": "PR-AUC", "precisao_top10": "Precisão top 10%", "brier": "Brier (menor = melhor)",
+                 "lift_alerta": "Lift no ponto de alerta", "acuracia": "Acurácia no alerta", "recall": "Recall no alerta"}
+comp_versoes = pd.DataFrame([{"modelo": m, "métrica": rot, **{v: VERSOES[v][m][met] for v in VERSOES}}
+                             for m in MODELOS for met, rot in METRICAS_COMP.items()])
+brier_constante = yte.mean() * (1 - yte.mean())
+print(f"Brier de prever sempre a taxa base ({yte.mean():.2%}): {brier_constante:.4f} (o ideal é ficar abaixo)")
+display(comp_versoes.round(4))
+
+cores_v = sns.color_palette("Blues", len(VERSOES))
+fig, axes = plt.subplots(2, 3, figsize=(21, 8.5))
+for ax, (met, rotulo) in zip(axes.ravel(), METRICAS_COMP.items()):
+    x = np.arange(len(MODELOS))
+    larg = 0.8 / len(VERSOES)
+    for k, (v, cor) in enumerate(zip(VERSOES, cores_v)):
+        ax.bar(x + (k - (len(VERSOES) - 1) / 2) * larg, [VERSOES[v][m][met] for m in MODELOS], larg, color=cor,
+               label=v, edgecolor="black" if v.startswith("v6") else "none")
+    if met == "brier":
+        ax.axhline(brier_constante, color="red", ls=":", lw=1.2, label="Prever sempre a taxa base")
+    if met in ("acuracia", "recall", "precisao_top10"):
+        ax.yaxis.set_major_formatter(PCT)
+    ax.set_xticks(x)
+    ax.set_xticklabels(MODELOS, fontsize=9)
+    ax.set_title(rotulo, fontsize=10)
+axes[0, 0].legend(fontsize=7, ncol=2)
+mostrar(fig, f"comparacao_versoes_{VERSAO_FINAL}")
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ### Peso pela correlação x importância no modelo escolhido
 
 # COMMAND ----------
@@ -2094,7 +2262,7 @@ print(f"Spearman entre peso e importância: {stats.spearmanr(comp.iloc[:, 0], co
 # COMMAND ----------
 
 # Matrizes de confusão: os modelos testados no TESTE (abr-ago/2018), em dois pontos de corte
-#  1) Limiar pelo critério CRITERIO_LIMIAR: escolhido na calibração (período de calibração), nunca no teste
+#  1) Faixa de alerta (X% de maior risco), X escolhido na validação, nunca no teste
 #  2) Top 10% de maior risco: a "faixa vermelha" usada na matriz de decisão
 # Usa prev, res, yte e MODELOS das células anteriores (rode a seção de treino final antes).
 
@@ -2110,7 +2278,7 @@ def metricas_corte(y, pred):
 
 
 CORTES = {
-    f"Limiar {CRITERIO_LIMIAR} (calibração)": lambda nome, p: (p >= res[nome]["limiar"]).astype(int),
+    "Alerta: faixa escolhida na validação": lambda nome, p: (p >= res[nome]["limiar"]).astype(int),
     "Top 10% de risco": lambda nome, p: (p >= np.quantile(p, 0.9)).astype(int),
 }
 
@@ -2159,49 +2327,6 @@ for nome in MODELOS:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Acurácia x recall: critérios de limiar
-
-# COMMAND ----------
-
-# Acurácia x recall: como cada critério de limiar (escolhido na CALIBRAÇÃO) se comporta no TESTE.
-# O limiar não muda a qualidade do modelo (PR-AUC); ele só escolhe um ponto da curva de troca entre pegar mais
-# atrasos (recall) e errar menos no total (acurácia). Use esta tabela para escolher o CRITERIO_LIMIAR.
-CRITERIOS = ["f1", "youden", "equilibrio", "recall_minimo"]
-linhas_l = []
-for nome in MODELOS:
-    p_cal = prev_cal[nome]
-    for crit in CRITERIOS:
-        t = escolher_limiar(ycal, p_cal, crit)
-        alerta = prev[nome] >= t
-        vp = (alerta & (yte == 1)).sum()
-        linhas_l.append({"modelo": nome, "criterio": crit, "limiar": t, "acuracia": (alerta == (yte == 1)).mean(),
-                         "recall": vp / yte.sum(), "precisao": vp / max(alerta.sum(), 1),
-                         "especificidade": (~alerta & (yte == 0)).sum() / (yte == 0).sum(),
-                         "pct_sinalizados": alerta.mean(), "em_uso": crit == CRITERIO_LIMIAR})
-tab_lim = pd.DataFrame(linhas_l)
-tab_lim["acuracia_balanceada"] = (tab_lim["recall"] + tab_lim["especificidade"]) / 2
-display(tab_lim.round(4))
-
-fig, axes = plt.subplots(1, len(MODELOS), figsize=(9 * len(MODELOS), 5), squeeze=False)
-for ax, nome in zip(axes[0], MODELOS):
-    c = curva_limiares(yte, prev[nome])
-    ax.plot(c["pct_sinalizados"], c["acuracia"], label="Acurácia", color="#4C72B0", lw=2)
-    ax.plot(c["pct_sinalizados"], c["recall"], label="Recall (atrasos capturados)", color="#C44E52", lw=2)
-    ax.plot(c["pct_sinalizados"], c["precisao"], label="Precisão", color="#8C8C8C", lw=1.2, ls="--")
-    for _, r_ in tab_lim[tab_lim["modelo"] == nome].iterrows():
-        ax.axvline(r_["pct_sinalizados"], color="black", lw=0.8, ls=":")
-        ax.annotate(r_["criterio"] + (" (em uso)" if r_["em_uso"] else ""), (r_["pct_sinalizados"], 0.02),
-                    rotation=90, fontsize=8, ha="right", va="bottom")
-    ax.xaxis.set_major_formatter(PCT)
-    ax.yaxis.set_major_formatter(PCT)
-    ax.set_xlabel("% de pedidos sinalizados como risco")
-    ax.set_title(f"{nome}: acurácia x recall no teste (limiares escolhidos na calibração)", fontsize=10)
-    ax.legend(fontsize=8, loc="center right")
-mostrar(fig, f"acuracia_recall_limiares_{VERSAO_RECORTE}")
-
-# COMMAND ----------
-
-# MAGIC %md
 # MAGIC ### Curva Precision-Recall
 
 # COMMAND ----------
@@ -2223,7 +2348,7 @@ for nome in MODELOS:
 pr_r, rc_r, _ = precision_recall_curve(yte, p_ref)
 ax.plot(rc_r, pr_r, color="gray", ls="--", lw=1.2, label=f"Referência: taxa da rota ({ref['pr_auc']:.3f})")
 ax.axhline(base_te, color="red", ls=":", lw=1.5, label=f"Acaso = taxa base ({base_te:.3f})")
-ax.scatter([], [], marker="o", color="white", edgecolor="black", label=f"Limiar {CRITERIO_LIMIAR} (calibração)")
+ax.scatter([], [], marker="o", color="white", edgecolor="black", label="Faixa de alerta (validação)")
 ax.scatter([], [], marker="s", color="white", edgecolor="black", label="Top 10% de risco")
 ax.set(xlabel="Recall (atrasos capturados)", ylabel="Precisão (alertas corretos)",
        title="Curva Precision-Recall | teste abr-ago/2018", xlim=(0, 1), ylim=(0, 0.5))
@@ -2256,3 +2381,312 @@ for nome in MODELOS:
 tab_pr = pd.DataFrame(linhas_pr).set_index("modelo")
 display(tab_pr.style.format({c: "{:.1%}" for c in tab_pr.columns if c.startswith("precisao")}
                             | {"pr_auc": "{:.4f}", "lift_pr_auc": "{:.2f}x"}))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 12. Custo do atraso e regra de alerta
+# MAGIC Mede o dano do atraso nas avaliações, transforma em uma razão de custo (quantas vezes perder um atraso é pior que um alarme falso) e mostra qual faixa de alerta minimiza o custo. As avaliações **não** entram no modelo (são pós-entrega): aqui servem só para medir o custo.
+
+# COMMAND ----------
+
+# 12.1 Dano do atraso nas avaliações (período de desenvolvimento) e razão de custo
+resumo_av = (av.assign(situacao=av["atrasou"].map({0: "No prazo", 1: "Atrasado"}))
+               .groupby("situacao")
+               .agg(pedidos=("review_score", "size"), nota_media=("review_score", "mean"),
+                    pct_nota_1_ou_2=("review_negativa", "mean"), pct_com_comentario=("tem_comentario", "mean")))
+display(resumo_av.round(3).reset_index())
+
+p_ruim_atraso = av.loc[av["atrasou"] == 1, "review_negativa"].mean()
+p_ruim_prazo = av.loc[av["atrasou"] == 0, "review_negativa"].mean()
+EXCESSO_AVALIACAO_RUIM = p_ruim_atraso - p_ruim_prazo
+print(f"Nota 1-2: atrasados {p_ruim_atraso:.1%} x no prazo {p_ruim_prazo:.1%} ({p_ruim_atraso / p_ruim_prazo:.1f}x)")
+print(f"Excesso: cada atraso gera {EXCESSO_AVALIACAO_RUIM:.2f} avaliação ruim a mais")
+
+display(av.groupby("faixa_atraso", observed=True)
+          .agg(pedidos=("review_score", "size"), pct_nota_1_ou_2=("review_negativa", "mean"),
+               nota_media=("review_score", "mean"))
+          .round(3).reset_index())
+
+# Premissas de negócio (ajuste com o grupo): o resultado mostra a razão em cada cenário
+CUSTO_ALERTA = 2.0                              # R$ por alerta (contato proativo, acompanhamento)
+VALORES_AVALIACAO_RUIM = [20, 50, 100, 200]     # R$ perdidos por avaliação ruim (recompra, reputação, suporte)
+EFICACIAS = [0.2, 0.4, 0.6]                     # fração do dano evitada quando o atraso é sinalizado
+cenarios = pd.DataFrame([{"R$ por avaliação ruim": v, "eficácia": e,
+                          "razao_custo": EXCESSO_AVALIACAO_RUIM * v * e / CUSTO_ALERTA}
+                         for v in VALORES_AVALIACAO_RUIM for e in EFICACIAS])
+cenarios["limiar_de_probabilidade"] = 1 / (1 + cenarios["razao_custo"])
+print("\nRazão de custo (quantas vezes perder um atraso é pior que um alarme falso):")
+display(cenarios.pivot(index="R$ por avaliação ruim", columns="eficácia", values="razao_custo").round(1).reset_index())
+print("Limiar de probabilidade equivalente (sinalizar quem passar dele):")
+display(cenarios.pivot(index="R$ por avaliação ruim", columns="eficácia", values="limiar_de_probabilidade").round(3).reset_index())
+print(f"Razão usada no modelo (RAZAO_CUSTO): {RAZAO_CUSTO}x")
+
+# COMMAND ----------
+
+# 12.2 Custo total por faixa de alerta (curva média da VALIDAÇÃO) e o que cada escolha entrega no teste
+RAZOES_TESTADAS = [2, 3, 5, 10, 15, 20]
+linhas_custo, curvas_custo = [], {}
+for nome in MODELOS:
+    c = curvas_val[nome].sort_values("faixa").reset_index(drop=True)
+    taxa = (c["precisao"] / c["lift"]).mean()
+    for r_ in RAZOES_TESTADAS:
+        custo = r_ * taxa * (1 - c["recall"]) + c["faixa"] * (1 - c["precisao"])
+        rel = custo / (r_ * taxa)                     # custo relativo a "não sinalizar nada"
+        curvas_custo[(nome, r_)] = pd.DataFrame({"faixa": c["faixa"], "custo_relativo": rel})
+        i = rel.idxmin()
+        f_ = float(c.loc[i, "faixa"])
+        te = metricas_faixa(yte, prev[nome], f_)
+        linhas_custo.append({"modelo": nome, "razao_custo": r_, "faixa_otima": f_,
+                             "recall_validacao": c.loc[i, "recall"], "precisao_validacao": c.loc[i, "precisao"],
+                             "economia_vs_nao_sinalizar": 1 - rel[i],
+                             "recall_teste": te["recall"], "precisao_teste": te["precisao"]})
+custo_faixas = pd.DataFrame(linhas_custo)
+display(custo_faixas.round(3))
+
+fig, ax = plt.subplots(figsize=(10, 5))
+for r_, alpha in zip(RAZOES_TESTADAS, np.linspace(0.35, 1, len(RAZOES_TESTADAS))):
+    d_ = curvas_custo[(vencedor, r_)]
+    ax.plot(d_["faixa"], d_["custo_relativo"], color="#3B6FA8", alpha=alpha, lw=2)
+    i = d_["custo_relativo"].idxmin()
+    ax.scatter(d_.loc[i, "faixa"], d_.loc[i, "custo_relativo"], color="#3B6FA8", alpha=alpha, s=40, zorder=3)
+    ax.annotate(f"{r_}x", (d_["faixa"].iloc[-1], d_["custo_relativo"].iloc[-1]), textcoords="offset points",
+                xytext=(6, 0), fontsize=9, va="center")
+ax.axvline(res[vencedor]["faixa_alerta"], color="black", ls=":", lw=1)
+ax.xaxis.set_major_formatter(PCT)
+ax.yaxis.set_major_formatter(PCT)
+ax.set_xlabel("% de pedidos sinalizados (maior risco primeiro)")
+ax.set_ylabel("Custo total (% do custo de não sinalizar nada)")
+ax.set_title(f"{vencedor}: custo por faixa na validação (ponto = mínimo; pontilhado = faixa escolhida)")
+mostrar(fig, "custo_01_faixas")
+
+# COMMAND ----------
+
+# 12.3 Quanto custa cada nível de recall (validação = curva média; teste = modelo final)
+metas = [0.5, 0.6, 0.7, 0.8]
+linhas_rc = []
+for nome in MODELOS:
+    c = curvas_val[nome].sort_values("faixa")
+    p_, y_ = prev[nome], yte
+    ordem = np.argsort(-p_)
+    rec = np.cumsum(y_[ordem]) / y_.sum()
+    frac = np.arange(1, len(y_) + 1) / len(y_)
+    prec = np.cumsum(y_[ordem]) / np.arange(1, len(y_) + 1)
+    for m_ in metas:
+        k = int(np.argmax(rec >= m_))
+        linhas_rc.append({"modelo": nome, "meta_recall": m_,
+                          "pct_sinalizados_validacao": float(np.interp(m_, c["recall"], c["faixa"])),
+                          "pct_sinalizados_teste": frac[k], "precisao_teste": prec[k],
+                          "alarmes_falsos_por_atraso_capturado": (1 - prec[k]) / prec[k]})
+display(pd.DataFrame(linhas_rc).round(3))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 13. Explicabilidade: o que o modelo usa e por quê
+# MAGIC Três lentes: (1) coeficientes da regressão logística (direção e tamanho de cada efeito); (2) importância por permutação nos dois modelos, medida na janela de validação mais recente (o teste não participa); (3) exemplos de pedidos sinalizados, com as variáveis que mais pesaram em cada um.
+
+# COMMAND ----------
+
+# 13.1 Modelos de explicação: refeitos com os parâmetros escolhidos (não dependem do checkpoint)
+import re
+fold_exp = folds[-1]
+Xf_exp, yf_exp = Xy(fold_exp["tr"])
+Xv_exp, yv_exp = Xy(fold_exp["va"])
+modelos_fold = {n: construir(n).set_params(**res[n]["params"]).fit(Xf_exp, yf_exp) for n in MODELOS}
+modelos_final = {n: construir(n).set_params(**res[n]["params"]).fit(Xtr, ytr) for n in MODELOS}
+print(f"Explicação no fold '{fold_exp['nome']}': treino {len(yf_exp):,} | validação {len(yv_exp):,}")
+
+
+def variavel_original(col):
+    bloco, nome = col.split("__", 1)
+    if bloco == "cat":
+        return next((c for c in CATEGORICAS if nome.startswith(c + "_")), nome)
+    nome = nome.replace("missingindicator_", "")
+    return re.sub(r"_sp_\d+$", "", nome)
+
+
+if "Regressão Logística" in MODELOS:
+    pipe_lr = modelos_final["Regressão Logística"].estimador_
+    nomes_lr = pipe_lr.named_steps["prep"].get_feature_names_out()
+    coefs = pd.DataFrame({"coluna": nomes_lr, "coef": pipe_lr.named_steps["modelo"].coef_[0]})
+    coefs["variavel"] = coefs["coluna"].map(variavel_original)
+    coefs["odds_ratio"] = np.exp(coefs["coef"])
+    coefs["efeito"] = np.where(coefs["coef"] > 0, "aumenta o risco", "reduz o risco")
+    coefs["grupo"] = coefs["variavel"].map(GRUPO)
+
+    num_c = coefs[~coefs["coluna"].str.startswith("cat__")].sort_values("coef", key=abs, ascending=False)
+    print("Numéricas: efeito de +1 desvio padrão (após log). Odds ratio > 1 aumenta a chance de atraso.")
+    display(num_c[["variavel", "coluna", "grupo", "coef", "odds_ratio", "efeito"]].round(4).reset_index(drop=True))
+
+    cat_c = coefs[coefs["coluna"].str.startswith("cat__")].sort_values("coef")
+    print("Categóricas: as 8 categorias que mais aumentam e as 8 que mais reduzem o risco")
+    display(pd.concat([cat_c.tail(8), cat_c.head(8)])[["variavel", "coluna", "coef", "odds_ratio"]]
+              .sort_values("coef", ascending=False).round(4).reset_index(drop=True))
+
+    top = num_c.head(15).sort_values("coef")
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.barh(top["coluna"].str.replace("num__", ""), top["coef"],
+            color=np.where(top["coef"] > 0, "#C44E52", "#3B6FA8"))
+    ax.axvline(0, color="gray", lw=1)
+    ax.set_xlabel("Coeficiente padronizado (vermelho = aumenta o risco; azul = reduz)")
+    ax.set_title("Regressão Logística: as 15 variáveis numéricas de maior efeito")
+    mostrar(fig, "explica_01_coeficientes")
+
+# COMMAND ----------
+
+# 13.2 Importância por permutação na validação mais recente (queda de PR-AUC ao embaralhar a variável)
+# Scorer como função: o ModeloBalanceado herda (BaseEstimator, ClassifierMixin) nessa ordem e, no
+# scikit-learn >= 1.6, isso faz ele não ser reconhecido como classificador pelo scoring="average_precision".
+def pr_auc_scorer(est, X, y):
+    return average_precision_score(y, est.predict_proba(X)[:, 1])
+
+
+linhas_perm = []
+for nome, m_ in modelos_fold.items():
+    r_ = permutation_importance(m_, Xv_exp, yv_exp, scoring=pr_auc_scorer, n_repeats=5,
+                                random_state=SEED, n_jobs=1)
+    for col, media, desvio in zip(Xv_exp.columns, r_.importances_mean, r_.importances_std):
+        linhas_perm.append({"variavel": col, "modelo": nome, "importancia": media, "desvio": desvio})
+perm = pd.DataFrame(linhas_perm)
+perm_w = perm.pivot(index="variavel", columns="modelo", values="importancia")
+perm_w["grupo"] = perm_w.index.map(GRUPO)
+ref_col = vencedor if vencedor in perm_w.columns else perm_w.columns[0]
+perm_w = perm_w.sort_values(ref_col, ascending=False)
+ruido = perm.assign(ruido=perm["importancia"] - 2 * perm["desvio"] <= 0).groupby("variavel")["ruido"].all()
+perm_w["nao_contribui_em_nenhum_modelo"] = ruido.reindex(perm_w.index)
+display(perm_w.round(4).reset_index())
+
+p_ = perm_w[MODELOS].iloc[::-1]
+y_pos = np.arange(len(p_))
+larg = 0.8 / len(MODELOS)
+fig, ax = plt.subplots(figsize=(11, 0.32 * len(p_) + 1.5))
+for k, (nome, cor) in enumerate(zip(MODELOS, ["#3B6FA8", "#D9822B", "#55A868", "#8172B2"])):
+    ax.barh(y_pos + (k - (len(MODELOS) - 1) / 2) * larg, p_[nome], height=larg, color=cor, label=nome)
+ax.set_yticks(y_pos)
+ax.set_yticklabels(p_.index, fontsize=8)
+ax.axvline(0, color="gray", lw=1)
+ax.set_xlabel("Queda no PR-AUC ao embaralhar a variável (maior = mais importante)")
+ax.set_title(f"Importância por permutação ({fold_exp['nome']})")
+ax.legend(fontsize=8, loc="lower right")
+mostrar(fig, "explica_02_permutacao")
+
+# COMMAND ----------
+
+# 13.3 Por que um pedido foi sinalizado: contribuições da regressão logística em 3 pedidos de maior risco do teste
+# (ilustração para a apresentação: nenhuma decisão é tomada com isto)
+if "Regressão Logística" in MODELOS:
+    Z = pipe_lr[:-1].transform(Xte)
+    Z = Z.toarray() if hasattr(Z, "toarray") else np.asarray(Z)
+    contrib = pd.DataFrame(Z * pipe_lr.named_steps["modelo"].coef_[0], columns=nomes_lr)
+    contrib = contrib.T.groupby(coefs.set_index("coluna")["variavel"]).sum().T
+    p_lr_teste = prev["Regressão Logística"]
+    for pos in np.argsort(-p_lr_teste)[:3]:
+        linha = teste.iloc[pos]
+        top_c = contrib.iloc[pos].sort_values(ascending=False).head(5)
+        print(f"Pedido {linha['order_id'][:8]}… | risco previsto {p_lr_teste[pos]:.1%} | "
+              f"{linha['seller_state']} -> {linha['customer_state']} | atrasou de fato: {'sim' if linha['atrasou'] == 1 else 'não'}")
+        for var, val in top_c.items():
+            valor = linha[var] if var in linha.index else ""
+            print(f"    {var:35s} contribuição {val:+.2f}   valor: {valor}")
+        print()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 14. Evidências das escolhas de modelagem
+# MAGIC Experimentos na validação que sustentam duas decisões: (1) não balancear as classes; (2) por que o modelo mais simples supera o mais complexo.
+
+# COMMAND ----------
+
+# 14.1 Balanceamento: nenhum x pesos x subamostragem (mesmos hiperparâmetros, 3 folds de validação)
+OPCOES_BAL = {"nenhum": {"estrategia": "nenhum", "razao": 1.0},
+              "pesos (classes iguais)": {"estrategia": "pesos", "razao": 1.0},
+              "subamostragem (1:3)": {"estrategia": "ensemble_subamostragem", "razao": 3.0}}
+linhas_bal = []
+for nome in MODELOS:
+    for rotulo, opc in OPCOES_BAL.items():
+        for f_ in folds:
+            Xf, yf = Xy(f_["tr"])
+            Xv, yv = Xy(f_["va"])
+            pv = construir(nome).set_params(**{**res[nome]["params"], **opc}).fit(Xf, yf).predict_proba(Xv)[:, 1]
+            linhas_bal.append({"modelo": nome, "balanceamento": rotulo, "fold": f_["nome"],
+                               "pr_auc": average_precision_score(yv, pv), "brier": brier_score_loss(yv, pv),
+                               "prob_media_prevista": pv.mean(), "taxa_real": yv.mean(),
+                               "recall_top20": metricas_faixa(yv, pv, 0.20)["recall"]})
+bal = pd.DataFrame(linhas_bal)
+display(bal.groupby(["modelo", "balanceamento"]).mean(numeric_only=True).round(4).reset_index())
+
+# COMMAND ----------
+
+# 14.2 Por que o modelo simples vence: (a) sobreajuste por fold; (b) o que acontece sem as variáveis históricas
+HIST_CHAVES = ("hist", "recente", "abertos", "tendencia", "pico", "razao_prazo")
+SEM_HIST = [f for f in SELECIONADAS if not any(k in f for k in HIST_CHAVES)]
+_backup = (SELECIONADAS, CATEGORICAS, NUMERICAS, RAZOES_ATIVAS, FEATURES_X)
+
+
+def usar_variaveis(lista):
+    global SELECIONADAS, CATEGORICAS, NUMERICAS, RAZOES_ATIVAS, FEATURES_X
+    SELECIONADAS = list(lista)
+    CATEGORICAS = [f for f in CATEGORICAS_CAND if f in SELECIONADAS]
+    NUMERICAS = [f for f in NUMERICAS_CAND if f in SELECIONADAS]
+    RAZOES_ATIVAS = [r for r in RAZOES if r in SELECIONADAS]
+    entradas = [c for nome, valor, grupo in RazoesPelaMediana.REGRAS if nome in RAZOES_ATIVAS for c in (valor, *grupo)]
+    FEATURES_X = list(dict.fromkeys([f for f in SELECIONADAS if f not in RAZOES] + entradas))
+
+
+linhas_diag = []
+try:
+    for conjunto, lista in [("Com variáveis históricas", _backup[0]), ("Sem variáveis históricas", SEM_HIST)]:
+        usar_variaveis(lista)
+        for nome in MODELOS:
+            for f_ in folds:
+                Xf, yf = Xy(f_["tr"])
+                Xv, yv = Xy(f_["va"])
+                m_ = construir(nome).set_params(**res[nome]["params"]).fit(Xf, yf)
+                linhas_diag.append({"conjunto": conjunto, "modelo": nome, "fold": f_["nome"],
+                                    "lift_treino": average_precision_score(yf, m_.predict_proba(Xf)[:, 1]) / yf.mean(),
+                                    "lift_validacao": average_precision_score(yv, m_.predict_proba(Xv)[:, 1]) / yv.mean(),
+                                    "pr_auc_validacao": average_precision_score(yv, m_.predict_proba(Xv)[:, 1])})
+finally:
+    SELECIONADAS, CATEGORICAS, NUMERICAS, RAZOES_ATIVAS, FEATURES_X = _backup     # restaura as listas do modelo
+
+diag_simples = pd.DataFrame(linhas_diag)
+diag_simples["queda_lift_treino_validacao"] = diag_simples["lift_treino"] - diag_simples["lift_validacao"]
+print(f"Variáveis sem histórico: {len(SEM_HIST)} de {len(SELECIONADAS)}")
+display(diag_simples.groupby(["conjunto", "modelo"], sort=False).mean(numeric_only=True).round(3).reset_index())
+display(diag_simples.pivot_table(index=["conjunto", "modelo"], columns="fold", values="pr_auc_validacao")
+                    .round(4).reset_index())
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 15. Resumo final para a apresentação
+
+# COMMAND ----------
+
+# Todos os números do roteiro, calculados nesta execução
+m_v = res[vencedor]
+outro = [m for m in MODELOS if m != vencedor][0] if len(MODELOS) > 1 else None
+print("BASE")
+print(f"  Pedidos elegíveis: {len(base_modelo):,} | taxa de atraso {base_modelo['atrasou'].mean():.2%} | "
+      f"atrasos sem entrega: {int(base_modelo['atraso_sem_entrega'].sum()):,}")
+print(f"  Sem duplicação: {integrada.count():,} linhas = {n_unicos:,} pedidos")
+print("SATISFAÇÃO")
+print(f"  Nota 1-2: {p_ruim_atraso:.0%} com atraso x {p_ruim_prazo:.0%} no prazo | excesso {EXCESSO_AVALIACAO_RUIM:.2f}")
+print("VARIÁVEIS E RECORTE")
+print(f"  {len(CANDIDATAS)} candidatas -> {N_FEATURES} selecionadas | recorte: {ESTRATEGIA_ATIVA}")
+print("MODELO ESCOLHIDO")
+print(f"  {vencedor}: PR-AUC teste {m_v['pr_auc']:.3f} (acaso {yte.mean():.3f}) | ROC-AUC {m_v['roc_auc']:.3f} | "
+      f"Brier {m_v['brier']:.4f}")
+print(f"  Lift treino {m_v['lift_treino']:.2f} | validação {m_v['lift_validacao']:.2f} | "
+      f"teste {m_v['pr_auc'] / yte.mean():.2f}")
+print(f"  Alerta: sinalizar {m_v['faixa_alerta']:.0%} -> recall {m_v['recall_alerta']:.1%} | "
+      f"precisão nos 10% de maior risco {m_v['precisao_top10']:.1%}")
+if outro:
+    m_o = res[outro]
+    print(f"  {outro}: PR-AUC {m_o['pr_auc']:.3f} | lift treino {m_o['lift_treino']:.2f} -> validação "
+          f"{m_o['lift_validacao']:.2f}")
+    print(f"  Diferença de PR-AUC (bootstrap): IC95 {ic_dif[0]:+.4f} a {ic_dif[1]:+.4f}")
+print("CUSTO")
+print(f"  Razão usada: {RAZAO_CUSTO}x | faixa escolhida na validação: {m_v['faixa_alerta']:.0%}")

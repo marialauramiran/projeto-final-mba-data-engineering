@@ -5,7 +5,7 @@ import pandas as pd
 import streamlit as st
 
 from predicoes import (BASE_PRED, calcular_cenario, carregar_predictions, fmt_int, fmt_pct,
-                       recomendacoes_cenario)
+                       recomendacoes_cenario, rodape_cenario)
 from src import config as C
 from src.dados import TabelaNaoEncontrada, carregar, diagnostico
 from src.regras import (card_atraso, card_categoria, card_frete, card_mercado, card_reputacao,
@@ -113,9 +113,9 @@ def render(icone, titulo, card, rodape=None):
     mets = "".join(f'<div><p class="rx-lbl">{html.escape(k)}</p><p class="rx-met">{html.escape(str(v))}</p></div>'
                    for k, v in card.metricas.items())
     linhas = ""
-    for linha in card.linhas:
-        valor = pill(linha[2], str(linha[1])) if len(linha) == 3 else html.escape(str(linha[1]))
-        linhas += f'<div class="rx-row"><span>{html.escape(str(linha[0]))}</span><span>{valor}</span></div>'
+    for l in card.linhas:
+        valor = pill(l[2], str(l[1])) if len(l) == 3 else html.escape(str(l[1]))
+        linhas += f'<div class="rx-row"><span>{html.escape(str(l[0]))}</span><span>{valor}</span></div>'
     topo_pill = pill("neutro", card.pill) if card.cor == "neutro" and card.pill else pill(card.cor)
     foot = f'<div class="rx-foot">{html.escape(rodape)}</div>' if rodape else ""
     st.markdown(f'<div class="rx-card"><div class="rx-top"><span>{icone} {titulo}</span>{topo_pill}</div>'
@@ -203,6 +203,9 @@ else:
     except Exception as e:  # noqa: BLE001
         st.warning(f"Não consegui consultar predictions em {BASE_PRED}: {e}")
 
+if ind and ind.get("aviso"):
+    st.info(f"Modelo de ML não utilizado ({ind['aviso']}). Exibindo as probabilidades gravadas na base.")
+
 if ind is not None:
     if ind["pedidos"] == 0:
         topo = pill("neutro", "Sem dados")
@@ -215,7 +218,7 @@ if ind is not None:
         corpo = '<div class="rx-mets">' + "".join(
             f'<div><p class="rx-lbl">{k}</p><p class="rx-met">{v}</p></div>' for k, v in mets) + "</div>"
     st.markdown(f'<div class="rx-card"><div class="rx-top"><span>📈 Predições do cenário</span>{topo}</div>{corpo}'
-                f'<div class="rx-foot">Fonte: {html.escape(BASE_PRED)}/predictions · {html.escape(categoria)} · {html.escape(str(uf))} · '
+                f'<div class="rx-foot">{html.escape(rodape_cenario(ind))} · {html.escape(categoria)} · {html.escape(str(uf))} · '
                 f'R$ {preco:,.2f}–{preco_max:,.2f} · {peso}–{peso_max} g</div></div>', unsafe_allow_html=True)
 
 recs = "".join(f'<div class="rx-row"><span>{html.escape(r)}</span></div>'
@@ -227,3 +230,6 @@ with st.expander("Diagnóstico dos dados (para ajustar o mapeamento de colunas)"
     st.caption(f"Caminho: {C.BASE_PATH}")
     st.table(pd.DataFrame(diagnostico()))
     st.caption(f"Predições: {BASE_PRED}")
+    if ind and ind["pedidos"]:
+        st.caption(f"Fonte da predição: {ind['fonte']} · limiar de alto risco: {ind['limiar']:.2f}"
+                   + (f" · modelo gravado na base: {ind['modelo_base']}" if ind.get("modelo_base") else ""))
