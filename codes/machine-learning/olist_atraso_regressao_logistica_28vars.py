@@ -43,6 +43,8 @@ import pandas as pd
 from scipy import stats
 from scipy.optimize import brentq
 from scipy.special import expit, logit
+import uuid
+from datetime import datetime
 
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
@@ -933,3 +935,99 @@ rotas = (t.assign(rota=t["uf_origem"] + " -> " + t["uf_destino"])
                                taxa_real=("atrasou", "mean"))
           .query("pedidos >= 100").sort_values("risco_medio", ascending=False))
 display(rotas.head(15).round(4))
+
+# COMMAND ----------
+
+
+# Tabela principal de previsões do modelo de Machine Learning
+
+# 1. Definir as 28 features do novo modelo
+features_modelo = FEATURES
+
+# 2. Recuperar resultados do novo modelo
+modelo_escolhido = "regressao_logistica"
+probabilidades = np.asarray(p_te)
+limiar = float(LIMIAR_ALERTA)
+limiar_alto = float(LIMIAR_ALTO)
+resultados_reais = np.asarray(yte)
+
+# 3. Validar alinhamento
+assert len(teste) == len(probabilidades)
+assert len(teste) == len(resultados_reais)
+assert all(col in teste.columns for col in features_modelo)
+
+# 4. Criar cópia dos dados
+base = teste.reset_index(drop=True).copy()
+
+# 5. Classificar nível de risco
+nivel_risco = np.where(
+    probabilidades >= limiar_alto,
+    "alto",
+    np.where(probabilidades >= limiar, "medio", "baixo")
+)
+
+# 6. Criar tabela principal
+df_predictions = pd.DataFrame({
+    "prediction_id": [str(uuid.uuid4()) for _ in range(len(base))],
+    "order_id": base["order_id"].astype(str),
+
+    # Campos para filtros da aplicação
+    "categoria": base["categoria"],
+    "seller_state": base["seller_state"],
+    "customer_state": base["customer_state"],
+    "valor_produtos": base["valor_produtos"],
+    "peso_total_g": base["peso_total_g"],
+
+    # Resultados do modelo
+    "probability": probabilidades,
+    "predicted_label": (probabilidades >= limiar).astype(int),
+    "actual_label": resultados_reais.astype(int),
+    "threshold": limiar,
+    "nivel_risco": nivel_risco,
+
+    # Metadados
+    "prediction_type": "test",
+    "model_name": modelo_escolhido,
+    "model_version": "2.0",
+    "prediction_timestamp": datetime.now()
+})
+
+# 7. INPUT: armazenar as 28 features do modelo
+features_json = base[features_modelo].copy()
+
+df_predictions["inputs_json"] = features_json.apply(
+    lambda linha: linha.to_json(force_ascii=False),
+    axis=1
+)
+
+# 8. OUTPUT: armazenar os 4 resultados do modelo
+df_predictions["outputs_json"] = df_predictions.apply(
+    lambda linha: pd.Series({
+        "probability": float(linha["probability"]),
+        "predicted_label": int(linha["predicted_label"]),
+        "threshold": float(linha["threshold"]),
+        "nivel_risco": str(linha["nivel_risco"])
+    }).to_json(),
+    axis=1
+)
+
+# 9. Conferir estrutura
+print("Dimensões:", df_predictions.shape)
+print("Quantidade de features:", len(features_modelo))
+
+display(df_predictions.head())
+
+# 10. Converter Pandas para Spark
+df_predictions_spark = spark.createDataFrame(df_predictions)
+
+# 11. Salvar no Volume
+PATH_PREDICTIONS = "/Volumes/workspace/olist_gold/ml_predictions/predictions"
+
+(
+    df_predictions_spark.write
+    .format("parquet")
+    .mode("overwrite")
+    .save(PATH_PREDICTIONS)
+)
+
+print("Previsões salvas no Volume com sucesso!")
