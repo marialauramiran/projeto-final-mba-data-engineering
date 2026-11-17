@@ -1,0 +1,17 @@
+bundle:
+  name: raio-x-vendedor
+
+variables:
+  app_name:
+    default: raio-x-vendedor2
+
+targets:
+  dev:
+    default: true
+    workspace:
+      host: https://dbc-c64881aa-891c.cloud.databricks.com/
+    resources:
+      apps:
+        raio_x_vendedor:
+          name: ${var.app_name}
+          source_code_path: ./raio_x_app
