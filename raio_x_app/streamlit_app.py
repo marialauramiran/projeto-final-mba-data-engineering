@@ -78,9 +78,9 @@ def render(icone, titulo, card, fonte):
     mets = "".join(f'<div><p class="rx-lbl">{html.escape(k)}</p><p class="rx-met">{html.escape(str(v))}</p></div>'
                    for k, v in card.metricas.items())
     linhas = ""
-    for l in card.linhas:
-        valor = pill(l[2], str(l[1])) if len(l) == 3 else html.escape(str(l[1]))
-        linhas += f'<div class="rx-row"><span>{html.escape(str(l[0]))}</span><span>{valor}</span></div>'
+    for linha in card.linhas:
+        valor = pill(linha[2], str(linha[1])) if len(linha) == 3 else html.escape(str(linha[1]))
+        linhas += f'<div class="rx-row"><span>{html.escape(str(linha[0]))}</span><span>{valor}</span></div>'
     topo = pill("neutro", card.pill) if card.cor == "neutro" and card.pill else pill(card.cor)
     rodape = " · ".join(x for x in (card.nota, f"Fonte: {fonte}") if x)
     st.markdown(f'<div class="rx-card"><div class="rx-top"><span>{icone} {html.escape(titulo)}</span>{topo}</div>'

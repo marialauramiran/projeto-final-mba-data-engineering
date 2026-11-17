@@ -206,7 +206,11 @@ def semaforo_geral(cards):
 
 
 def _regioes(card, cor):
-    return [l[0] for l in card.linhas if len(l) == 3 and l[2] == cor]
+    return [
+        linha[0]
+        for linha in card.linhas
+        if len(linha) == 3 and linha[2] == cor
+    ]
 
 
 def resumo(cards):

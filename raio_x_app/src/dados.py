@@ -72,8 +72,14 @@ def ler_bruto(tabela):
 # ---------------- padronização ----------------
 def mapear_colunas(tabela, colunas):
     """{nome_real: nome_do_app}, sem diferenciar maiúsculas."""
+
     reais = {str(c).lower(): c for c in colunas}
-    return {reais[r.lower()]: l for l, r in C.COLUNAS.get(tabela, {}).items() if r.lower() in reais}
+
+    return {
+        reais[nome_real.lower()]: nome_logico
+        for nome_logico, nome_real in C.COLUNAS.get(tabela, {}).items()
+        if nome_real.lower() in reais
+    }
 
 
 def padronizar(tabela, df):
@@ -102,7 +108,11 @@ def diagnostico():
         try:
             df = ler_bruto(tabela)
             achadas = set(mapear_colunas(tabela, df.columns).values())
-            faltando = [f"{l} → {r}" for l, r in mapa.items() if l not in achadas]
+            faltando = [
+                f"{nome_logico} → {nome_real}"
+                for nome_logico, nome_real in mapa.items()
+                if nome_logico not in achadas
+            ]
             linhas.append({"tabela": tabela, "status": "OK" if not faltando else "colunas faltando",
                            "linhas": len(df), "faltando": ", ".join(faltando) or "—",
                            "colunas": ", ".join(map(str, df.columns))})
