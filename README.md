@@ -1,199 +1,210 @@
-# 🩺 Raio-X do Vendedor: Diagnóstico 360° para Vendedores de E-commerce
+# 🩺 Raio-X do Vendedor: diagnóstico de viabilidade para vendedores de marketplace
 
-> Projeto Hands-On · MBA Data Engineering · Universidade Presbiteriana Mackenzie
+> Projeto Hands-On · MBA em Engenharia de Dados · Universidade Presbiteriana Mackenzie
+> Professor: Gustavo Ferreira
 > Base de dados: [Brazilian E-Commerce Public Dataset by Olist](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce) (Kaggle)
 
-![status](https://img.shields.io/badge/status-em%20desenvolvimento-yellow)
+![status](https://img.shields.io/badge/status-vers%C3%A3o%20final-brightgreen)
 ![python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![arquitetura](https://img.shields.io/badge/arquitetura-Bronze%20%7C%20Silver%20%7C%20Gold-orange)
 
----
+## Sumário
 
-## 📌 Sumário
+1. [Contexto e problema](#contexto-e-problema)
+2. [Objetivos](#objetivos)
+3. [O produto](#o-produto)
+4. [Base de dados](#base-de-dados)
+5. [Arquitetura de dados](#arquitetura-de-dados)
+6. [Modelo preditivo](#modelo-preditivo)
+7. [Principais resultados](#principais-resultados)
+8. [Ferramentas e tecnologias](#ferramentas-e-tecnologias)
+9. [Estrutura do repositório](#estrutura-do-repositório)
+10. [Como executar](#como-executar)
+11. [Governança e LGPD](#governança-e-lgpd)
+12. [Limitações](#limitações)
+13. [Próximos passos](#próximos-passos)
+14. [Equipe](#equipe)
+15. [Licença e créditos](#licença-e-créditos)
 
-1. [Contexto e problema](#-contexto-e-problema)
-2. [Objetivo geral e objetivos específicos](#-objetivo-geral-e-objetivos-específicos)
-3. [O produto](#-o-produto)
-4. [Bases de dados](#-bases-de-dados)
-5. [Arquitetura de dados](#-arquitetura-de-dados)
-6. [Metodologia do Diagnóstico 360°](#-metodologia-do-diagnóstico-360)
-7. [Ferramentas e tecnologias](#-ferramentas-e-tecnologias)
-8. [Estrutura do repositório](#-estrutura-do-repositório)
-9. [Como executar](#-como-executar-instruções-preliminares)
-10. [Resultados preliminares da EDA](#-resultados-preliminares-da-eda)
-11. [Escopo do MVP](#-escopo-do-mvp)
-12. [Cronograma](#-cronograma)
-13. [Equipe](#-equipe)
-14. [Licença e créditos dos dados](#-licença-e-créditos-dos-dados)
+## Contexto e problema
 
----
+Vendedores autônomos de marketplace decidem categoria, preço e logística com pouca informação. Quando o preço ignora o frete, quando a categoria já está saturada ou quando o prazo prometido não é cumprido, o resultado aparece na margem e na reputação. Nos dados da Olist (2016 a 2018):
 
-## 🎯 Contexto e problema
+- **8,1%** dos pedidos entregues chegam depois do prazo; esses pedidos recebem nota média **2,57**, contra **4,29** dos entregues no prazo;
+- **36,6%** dos itens têm frete igual ou superior a 30% do preço;
+- São Paulo concentra **42,0%** da demanda e **70,7%** dos vendedores.
 
-Vendedores autônomos de marketplace costumam tomar decisões sem enxergar o próprio desempenho em relação ao mercado: precificam "no achômetro", não medem o peso do frete, convivem com atrasos de entrega e só descobrem o problema quando a nota de avaliação já caiu. Muitos negócios quebram por não terem planejamento e acompanhamento de indicadores.
+## Objetivos
 
-Este projeto usa o ecossistema de dados da Olist (2016–2018) para mostrar, com dados reais, como uma **cultura data driven** melhora a saúde de um e-commerce.
+**Geral.** Desenvolver uma plataforma de dados em arquitetura lakehouse (Bronze, Silver e Gold) que combine análise exploratória, um modelo de risco de atraso e uma aplicação de consulta, para que o vendedor decida categoria, preço e logística com base em evidências.
 
-## 🚀 Objetivo geral e objetivos específicos
+**Específicos.**
 
-### Objetivo geral
+1. Estruturar a ingestão e o tratamento das nove tabelas da Olist no Databricks, com qualidade verificável.
+2. Quantificar concentração de mercado, peso do frete, prazo de entrega e reputação por categoria e região.
+3. Treinar e validar, com separação temporal e sem vazamento, um modelo de risco de atraso.
+4. Disponibilizar o resultado em uma aplicação Streamlit (semáforo de viabilidade) e em um painel executivo no Looker Studio.
+5. Aplicar boas práticas de governança e adequação à LGPD.
+6. Documentar o trabalho e relacionar as funções de uma equipe de dados às trilhas de carreira.
 
-Desenvolver, a partir dos dados públicos da Olist, uma solução de dados ponta a ponta (pipeline em camadas, análises e Machine Learning) que gere automaticamente um **Diagnóstico 360°** para vendedores autônomos. O diagnóstico compara o desempenho do vendedor com o dos **melhores lojistas da mesma categoria**, apresentando a **Nota de Saúde do E-commerce** e as **3 ações prioritárias** para ampliar o faturamento no mês seguinte.
+## O produto
 
-### Objetivos específicos
+| Módulo | O que entrega |
+|--------|---------------|
+| **Aplicação Raio-X do Vendedor** (Streamlit, Databricks App) | O vendedor informa categoria, UF de origem e faixas de preço e peso, e recebe um semáforo geral com cinco cartões (Mercado, Preço e frete, Risco de atraso, Reputação e Categoria) e recomendações |
+| **Painel executivo** (Looker Studio) | Três páginas por perfil: Executivo, Negócio e Técnico |
+| **Modelo de risco de atraso** | Probabilidade de atraso por pedido e faixas de risco (alto, médio e baixo) |
 
-1. **Integrar as 9 tabelas** da Olist em um único pipeline de dados nas camadas Bronze, Silver e Gold, com tratamento de qualidade e versionamento em Git.
-2. **Construir indicadores por vendedor** (receita, ticket, frete sobre preço, atraso, tempo de postagem, avaliações, cancelamentos, qualidade do anúncio) e o **benchmark dos melhores lojistas** de cada categoria.
-3. **Calcular a Nota de Saúde (0 a 100)** e um motor de priorização que seleciona as 3 ações de maior impacto.
-4. **Desenvolver o Radar de Oportunidades por Categoria e Geografia**: distância (Haversine) entre vendedor e comprador, mapa de calor logístico e análise de saturação (demanda × vendedores ativos).
-5. **Treinar e validar o Motor Preditivo de Riscos Logísticos** (Random Forest ou XGBoost) para estimar a probabilidade de atraso por rota, exibida em um termômetro verde, amarelo ou vermelho.
-6. **Entregar um relatório executivo automatizado** (PDF e/ou dashboard interativo) que reúne a nota, o radar, o termômetro e as ações prioritárias.
-7. **Documentar e validar** a solução (testes, métricas e apresentação final).
-
-## 📦 O produto
-
-| Módulo | O que entrega | Tabelas principais |
-|--------|---------------|--------------------|
-| **Diagnóstico 360°** (principal) | Nota de Saúde, comparação com os melhores lojistas da categoria e 3 ações prioritárias, em PDF ou dashboard | Todas as tabelas |
-| **Radar de Oportunidades** | Mapa de calor logístico, distância média vendedor → cliente e análise de saturação por categoria e região | `products`, `category_translation`, `customers`, `sellers`, `geolocation`, `order_items` |
-| **Motor Preditivo de Riscos Logísticos** | Termômetro de Envio (verde, amarelo, vermelho) com probabilidade de atraso por rota | `orders`, `order_items`, `sellers`, `customers`, `products`, `geolocation` |
-
-Os dois últimos módulos alimentam o Diagnóstico 360°: o Radar fornece o tamanho de mercado e a saturação, e o Motor Preditivo fornece o risco logístico da rota do vendedor.
-
-## 🗂 Bases de dados
+## Base de dados
 
 Os CSVs vêm do Kaggle e **não são versionados** neste repositório (veja `data/README.md`).
 
-| Arquivo | Linhas | Uso no projeto |
-|---------|-------:|----------------|
-| `olist_orders_dataset.csv` | 99.441 | Status e datas do pedido (compra, aprovação, postagem, entrega, estimativa) |
-| `olist_order_items_dataset.csv` | 112.650 | Vendedor, produto, preço e frete de cada item |
-| `olist_order_payments_dataset.csv` | 103.886 | Forma de pagamento e parcelas |
-| `olist_order_reviews_dataset.csv` | 99.224 | Nota de avaliação (1 a 5) |
-| `olist_customers_dataset.csv` | 99.441 | Estado, cidade e CEP do comprador |
-| `olist_sellers_dataset.csv` | 3.095 | Estado, cidade e CEP do vendedor |
-| `olist_products_dataset.csv` | 32.951 | Categoria, peso, dimensões e dados do anúncio |
-| `olist_geolocation_dataset.csv` | 1.000.163 | Latitude e longitude por prefixo de CEP |
-| `product_category_name_translation.csv` | 71 | Tradução das categorias (PT → EN) |
+| Tabela | Linhas (Silver) |
+|--------|----------------:|
+| `olist_orders_dataset` | 99.433 |
+| `olist_customers_dataset` | 99.441 |
+| `olist_order_items_dataset` | 112.650 |
+| `olist_order_payments_dataset` | 103.886 |
+| `olist_order_reviews_dataset` | 94.823 |
+| `olist_products_dataset` | 32.341 |
+| `olist_sellers_dataset` | 3.095 |
+| `product_category_name_translation` | 71 |
+| `olist_geolocation_dataset` | 1.000.163 |
 
-Período dos pedidos: **setembro de 2016 a outubro de 2018**. Existem **1.237 vendedores com pelo menos 10 pedidos entregues**, volume mínimo usado como referência para o benchmark.
+A integração gera **98.658 pedidos** (uma linha por pedido) com GMV de **R$ 13.590.394,52**, reconciliado com a tabela de itens. A janela do modelo vai de 1º/01/2017 a 31/08/2018.
 
-**Variáveis derivadas:** `delivery_time_days`, `delivery_delay_days` (negativo = entrega antecipada), `total_item_value`, `freight_ratio` (frete ÷ preço), `handling_time_days` (compra → postagem) e `distance_km` (Haversine).
+## Arquitetura de dados
 
-## 🏗 Arquitetura de dados
+![Arquitetura de dados](docs/img/arquitetura_dados.png)
 
-```
- CSVs (Kaggle)
-      │
-      ▼
-┌───────────┐   ┌─────────────┐   ┌──────────────────────┐   ┌─────────────────────┐
-│  BRONZE   │ → │   SILVER    │ → │        GOLD          │ → │      CONSUMO        │
-│ CSVs      │   │ tipagem,    │   │ métricas por vendedor│   │ Relatório PDF       │
-│ brutos    │   │ nulos,      │   │ benchmark por        │   │ Dashboard           │
-│ (raw)     │   │ duplicados, │   │ categoria, rotas,    │   │ Termômetro de Envio │
-│           │   │ joins       │   │ features de ML       │   │ Radar               │
-└───────────┘   └─────────────┘   └──────────────────────┘   └─────────────────────┘
-```
+O fluxo percorre cinco etapas: **fonte → preparação → armazenamento (lakehouse) → modelagem e análise → consumo**, com duas faixas transversais: governança e segurança, e engenharia de software.
 
-- **Bronze:** cópia fiel dos arquivos originais.
-- **Silver:** conversão de datas, filtro de pedidos entregues, remoção de duplicados, tradução das categorias, geolocalização agregada por prefixo de CEP (mediana) e junção das tabelas.
-- **Gold:** `gold_seller_metrics`, `gold_category_benchmark`, `gold_route_risk`, `gold_market_by_state` e `gold_seller_health_score`.
+| Camada | Conteúdo |
+|--------|----------|
+| **Bronze** | Cópia fiel dos 9 CSV em Parquet, sem regra de negócio |
+| **Silver** | 9 tabelas limpas, tipadas e com chaves validadas |
+| **Gold** | 5 tabelas de negócio (`gold_agg_mercado`, `gold_agg_frete`, `gold_ref_rotas`, `gold_agg_reputacao`, `gold_agg_categoria`) e tabelas de previsão (`predictions`, `aggregated_by_filter`, `filter_options`) |
 
-## 🧮 Metodologia do Diagnóstico 360°
+- Ambiente: Databricks Free Edition (serverless, AWS). Os dados ficam em Parquet nos Volumes do Unity Catalog (`/Volumes/workspace/olist_{bronze,silver,gold}`), lidos com `spark.read.parquet` (sem `cache()`).
+- O processamento é **em lote**. A base é histórica e fixa, sem atualização em tempo real, por isso o projeto não utiliza *streaming*. Essa camada só faria sentido se o projeto fosse conectado a uma fonte viva de pedidos.
 
-1. **Categoria do vendedor:** categoria com maior faturamento do vendedor.
-2. **Benchmark:** dentro de cada categoria, os melhores lojistas são os que têm volume mínimo de pedidos e estão no quartil superior de um índice composto (faturamento e satisfação). Categorias com poucos vendedores usam um agrupamento de fallback.
-3. **Indicadores comparados:** faturamento e ticket médio, frete sobre preço, % de atraso, tempo de postagem, nota média e % de notas 1–2, % de cancelamento e qualidade do anúncio (fotos e descrição).
-4. **Nota de Saúde (0 a 100):** média ponderada da posição do vendedor em cada indicador frente ao benchmark. Os pesos iniciais são hipóteses e serão calibrados e validados na fase de modelagem.
-5. **3 ações prioritárias:** ranking das lacunas em relação ao benchmark, ponderadas pelo peso do indicador, convertido em recomendações textuais (por exemplo, reduzir o tempo de postagem, rever o frete, melhorar o anúncio).
-6. **Motor preditivo de atraso:** classificação binária (atrasou ou não) com divisão temporal treino/teste, tratamento de desbalanceamento (cerca de 8% dos pedidos entregues chegam após o prazo estimado) e avaliação por PR-AUC, recall e precisão. Usa somente variáveis conhecidas antes da postagem, para evitar vazamento de dados.
+### Regras de tratamento da Silver
 
-> ⚠️ **Limitação:** o dataset é observacional. As ações recomendadas indicam associações com os melhores lojistas, não garantem causalidade nem a duplicação do faturamento. O relatório trará o **potencial estimado** com essa ressalva.
+| Regra | Impacto |
+|-------|---------|
+| Remover avaliações sem data, identificador ou pedido | 8.764 sem data; 1 sem `review_id`; 2.236 sem `order_id` |
+| Remover pedidos entregues sem data de entrega | 8 pedidos |
+| Remover produtos sem categoria | 610 produtos |
+| Manter uma avaliação por pedido (a mais recente) | 94.823 avaliações |
+| Padronizar tipos (datas, números, CEP com 5 dígitos) | Todas as tabelas |
+| Verificar chaves primárias | Sem duplicatas |
 
-## 🛠 Ferramentas e tecnologias
+## Modelo preditivo
 
-- **Google Colab:** exploração e prototipagem
-- **Databricks:** processamento e camadas Bronze, Silver e Gold
-- **Git / GitHub Actions:** versionamento e CI/CD
-- **Python:** pandas, scikit-learn, XGBoost, plotly/folium, Streamlit e geração de PDF
-- **Trello:** gestão do Kanban e das sprints
+- **Problema:** classificação binária (o pedido atrasa ou não), com 97.298 pedidos elegíveis e taxa de atraso de 7,84%.
+- **Algoritmo:** regressão logística (C = 0,003) com 28 variáveis conhecidas no momento da compra (categóricas, produto, prazo e rota, vendedor, plataforma e calendário).
+- **Validação temporal:** 3 dobras com embargo de 30 dias; treino até jan/2018, calibração em mar/2018 e teste de abr a ago/2018 (32.450 pedidos, 5,31% de atraso). Sem vazamento e com correção de prevalência.
+- **Comparação:** regressão logística (PR-AUC 0,1296 com 25 variáveis) contra *Gradient Boosting* (0,1135); diferença por *bootstrap* de +0,0161 (IC 95%: +0,0099 a +0,0221).
+- **Código:** `codes/machine-learning/olist_atraso_regressao_logistica_28vars.py`; histórico em `notebooks/histórico_modelo_de_ML/`.
 
-## 📁 Estrutura do repositório
+## Principais resultados
+
+| Métrica (teste, abr–ago/2018) | Valor |
+|-------------------------------|------:|
+| PR-AUC | 0,1307 (IC 95%: 0,1200 a 0,1428), 2,5 vezes o acaso (0,0531) |
+| ROC-AUC | 0,7167 |
+| Brier | 0,0489 |
+| Precisão no top 10% de risco | 16,24% (lift 3,06) |
+| Alerta sobre 40% dos pedidos | recall 69,6%, precisão 9,24%, acurácia 62,1% |
+
+Na análise exploratória: atraso de 2,9% a 23,9% entre UFs (AL 23,9%, MA 19,6%, PI 15,9%), picos de atraso em mar/2018 (21,4%), fev/2018 (16,0%) e nov/2017 (14,3%), e correlação de −0,33 entre nota e tempo de entrega.
+
+## Ferramentas e tecnologias
+
+| Função | Tecnologia |
+|--------|------------|
+| Plataforma de dados | Databricks Free Edition (serverless, AWS) |
+| Ingestão | kagglehub e PySpark |
+| Processamento | PySpark |
+| Armazenamento e catálogo | Parquet em Volumes do Unity Catalog |
+| Modelagem | scikit-learn |
+| Registro de modelos | MLflow (componente da arquitetura) |
+| Aplicação | Streamlit em Databricks Apps |
+| Painel | Looker Studio |
+| Versionamento e CI | GitHub e GitHub Actions (compilação e `ruff`) |
+| Infraestrutura como código | Terraform (data lake S3 com versionamento, criptografia e bloqueio de acesso público) |
+| Gestão | Trello (Kanban e sprints) |
+
+## Estrutura do repositório
 
 ```
 .
-├── src/
-│   ├── ingestion/        # CSVs → Bronze
-│   ├── transformation/   # Bronze → Silver → Gold
-│   ├── features/         # variáveis derivadas, distância Haversine
-│   ├── models/           # Nota de Saúde e modelo de atraso
-│   └── app/              # relatório PDF e dashboard
-├── notebooks/            # EDA e experimentos
-├── data/                 # dados locais (não versionados)
-│   ├── bronze/
-│   ├── silver/
-│   └── gold/
-├── docs/                 # escopo, arquitetura, dicionário de dados, apresentações
-├── infra/                # infraestrutura como código e CI/CD
-├── .github/workflows/    # GitHub Actions
+├── codes/
+│   ├── data-engineering/     # ingestão (Bronze), tratamento (Silver), agregação (Gold), modelo na Gold
+│   ├── data-analysis/        # análise exploratória
+│   └── machine-learning/     # regressão logística (28 variáveis)
+├── notebooks/                # EDA (10 perguntas) e histórico do modelo
+├── raio_x_app/               # aplicação Streamlit (Databricks App)
+├── backup/infraestructure/   # Terraform do data lake (dev)
+├── docs/                     # relatório técnico, escopo, briefing, dicionário de dados e imagens
+├── .github/workflows/        # GitHub Actions (CI)
+├── data/                     # dados locais (não versionados)
 ├── .gitignore
-├── requirements.txt
 └── README.md
 ```
 
-## ▶️ Como executar (instruções preliminares)
-
-> ⚠️ Em construção: será atualizado conforme o desenvolvimento avançar.
+## Como executar
 
 1. **Clonar o repositório**
    ```bash
-   git clone https://github.com/<organizacao-ou-usuario>/<nome-do-repositorio>.git
-   cd <nome-do-repositorio>
+   git clone https://github.com/marialauramiran/projeto-final-mba-data-engineering.git
+   cd projeto-final-mba-data-engineering
    ```
-2. **Criar o ambiente e instalar dependências**
+2. **Pipeline de dados (Databricks).** Importe os notebooks de `codes/data-engineering/` e execute na ordem: `ingestao_bronze` → `tratamento_silver` → `agregacao_gold` → `modelo_ml_gold`. A ingestão baixa os CSV com `kagglehub` e grava Parquet nos Volumes.
+3. **Aplicação.** Em `raio_x_app/`, instale as dependências e execute localmente (os dados da Gold são lidos dos Volumes quando publicada no Databricks Apps):
    ```bash
-   python -m venv .venv
-   source .venv/bin/activate      # Windows: .venv\Scripts\activate
+   cd raio_x_app
    pip install -r requirements.txt
+   streamlit run streamlit_app.py
    ```
-3. **Baixar os dados** do [Kaggle](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce) e colocar os 9 CSVs em `data/bronze/`.
-4. **Executar os notebooks** em `notebooks/`, começando pela EDA.
+4. **Painel.** O painel do Looker Studio consome as tabelas da Gold e está descrito na seção 6 do relatório técnico.
 
-## 📊 Resultados preliminares da EDA
+## Governança e LGPD
 
-- **Preço vs. frete:** preço médio de R$ 120,64 (mediana R$ 74,90) e frete médio de cerca de R$ 20,03. Em produtos de ticket baixo, o frete chega perto de 30% do valor pago.
-- **Pagamentos:** cartão de crédito domina (quase 80 mil transações), seguido pelo boleto (~20 mil).
-- **Logística:** tempo médio de entrega de 12,48 dias e atraso médio de -11,35 dias (as estimativas têm folga de segurança). Mesmo assim, cerca de 8% dos pedidos entregues chegam depois do prazo.
-- **Satisfação:** correlação de -0,30 entre tempo de entrega e nota; acima de 15 dias de espera, as notas de 1 estrela aumentam bastante.
-- **Geografia e demanda:** SP concentra os compradores, seguido por RJ e MG. As categorias líderes são Cama, Mesa e Banho e Saúde e Beleza.
-- **Perfil dos vendedores:** a maioria é pequena (mediana de 7 pedidos por vendedor), o que reforça o público-alvo do projeto.
+- **Catálogo e metadados:** dicionário de dados (tabela, coluna, tipo, descrição, origem) e relatório de nulos da Silver.
+- **Qualidade:** tipagem, tratamento de nulos, uma avaliação por pedido, chaves únicas, reconciliação do GMV e uma linha por pedido.
+- **LGPD:** clientes anonimizados na origem, colunas classificadas por sensibilidade, aplicação com agregados e CEP com 5 dígitos. Uso acadêmico, dados pseudonimizados e reidentificação proibida.
+- **Segurança:** dados em Volumes do Unity Catalog e aplicação com *service principal* e permissão de leitura.
+- **Linhagem:** notebooks versionados; a tabela `predictions` guarda a versão do modelo e as 28 entradas.
+- **Mapeamento:** Raw = Bronze, Trusted = Silver, Curated = Gold.
 
-## 🎯 Escopo do MVP
+## Limitações
 
-**Entra:** pipeline Bronze, Silver e Gold; indicadores por vendedor e benchmark; Nota de Saúde e 3 ações prioritárias; Radar (mapa de calor e saturação); modelo de atraso com termômetro; relatório PDF e/ou dashboard.
+- Dados históricos de um único marketplace (2016 a 2018).
+- Sinal preditivo moderado (PR-AUC 0,13 contra 0,053 do acaso); as probabilidades devem ser lidas como faixas de risco.
+- Resultados indicam associação, não causalidade; faltam variáveis como transportadora, clima e promoções.
+- Amostras pequenas em algumas rotas, categorias e estados do Nordeste.
 
-**Evolução futura:** simulador de precificação e margem, análise de sentimento (NLP) nos comentários das avaliações e simulação da Reforma Tributária.
+## Próximos passos
 
-## 📅 Cronograma
+O projeto é **em lote** por trabalhar com base histórica fixa. As evoluções previstas são:
 
-| Sprint | Período | Foco |
-|--------|---------|------|
-| 1 | 06/10 – 12/10 | Definição do problema, bases, arquitetura inicial, ferramentas, Kanban e repositório |
-| 2 | 13/10 – 19/10 | Modelagem das camadas, CI/CD e IaC, EDA inicial, protótipo de dashboard |
-| 3 | 20/10 – 26/10 | MVP e requisitos, ambiente técnico, camada de dados, modelo preditivo (versão inicial) |
-| 4 | 27/10 – 09/11 | Finalização do desenvolvimento, análise de resultados, testes, dashboard final |
-| 5 | 10/11 – 16/11 | Revisão do escopo, documentação final e apresentação |
+- **Dados:** *star schema* e *wide table* persistida na Gold.
+- **Modelo:** recalibração das probabilidades, outros algoritmos sob a mesma validação, registro no MLflow e, se necessário, *Model Serving*.
+- **Análises:** agrupamento de vendedores (K-Means), simulador de preço e margem e análise de texto das avaliações.
+- **Engenharia:** implantação automática no CI/CD, orquestração por *jobs*, testes de qualidade de dados e aplicação do Terraform.
+- **Governança:** proprietário e curador dos dados, permissões por camada e linhagem no Unity Catalog.
 
-O escopo v2 (Raio-X do Vendedor) foi formalizado em `docs/Projeto_Final_Escopo_v2.docx`. Acompanhe o Kanban no [Trello do projeto](https://trello.com/invite/b/6ad7e8d5b2fbe988950e3811/ATTI46fc8d1c2565216a02b99b5c5f70bb0d53AE229C/projeto-rgm-simulador-de-precos-mba-data-engineering).
+## Equipe
 
-## 👥 Equipe
+| Integrante | Perfil |
+|------------|--------|
+| Maria Laura | Engenharia de Dados |
+| Giulia Santiago | Análise de Dados e BI |
+| Luana Rodrigues | Ciência de Dados |
+| Vinicius Pontes | Engenharia de ML e governança |
 
-- Maria Laura
-- Giulia Santiago
-- Luana Rodrigues
-- Vinicius
+## Licença e créditos
 
-## 📄 Licença e créditos dos dados
-
-- Dados: *Brazilian E-Commerce Public Dataset by Olist*, no Kaggle, sob a licença **CC BY-NC-SA 4.0**. Uso exclusivamente acadêmico e não comercial.
-- Código: projeto acadêmico do MBA em Data Engineering, Mackenzie.
+- Dados: *Brazilian E-Commerce Public Dataset by Olist* (Kaggle), licença **CC BY-NC-SA 4.0**. Uso exclusivamente acadêmico e não comercial.
+- Código: projeto acadêmico do MBA em Engenharia de Dados, Mackenzie.
