@@ -1,4 +1,4 @@
-"""Cálculo dos cards, do semáforo geral e das recomendações. Tolerante a colunas ausentes."""
+"""Cálculo dos cards, do semáforo geral e das recomendações a partir das tabelas Gold reais."""
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -9,53 +9,46 @@ from . import config as C
 @dataclass
 class Card:
     cor: str                      # verde | amarelo | vermelho | neutro
-    metricas: dict                # destaque (2 números grandes)
+    metricas: dict
     linhas: list = field(default_factory=list)   # (rótulo, valor) ou (rótulo, valor, cor)
     pill: str | None = None
+    nota: str | None = None       # observação exibida no rodapé
 
 
 # ---------------- utilitários ----------------
-def _num(s):
-    return pd.to_numeric(s, errors="coerce")
-
-
 def filtra(df, **kw):
-    if df is None:
-        return pd.DataFrame()
+    if df is None or df.empty:
+        return pd.DataFrame(columns=getattr(df, "columns", []))
+    m = pd.Series(True, index=df.index)
     for col, v in kw.items():
         if v is not None and col in df.columns:
-            df = df[df[col].str.lower() == str(v).lower()]
-    return df
+            m &= df[col].astype("string").str.upper() == str(v).upper()
+    return df[m]
+
+
+def janela(df, ini=C.JANELA_INICIO, fim=C.JANELA_FIM):
+    if "mes" not in df.columns:
+        return df
+    return df[df["mes"].between(pd.Timestamp(ini), pd.Timestamp(fim))]
 
 
 def soma(df, col):
-    return float(_num(df[col]).sum()) if col in df.columns and not df.empty else None
+    return float(df[col].sum()) if col in df.columns and not df.empty and df[col].notna().any() else None
 
 
-def media(df, col, peso="pedidos"):
-    if col not in df.columns or df.empty:
+def media(df, col, peso=None):
+    if col not in df.columns or df.empty or df[col].notna().sum() == 0:
         return None
-    s = _num(df[col])
-    if s.notna().sum() == 0:
-        return None
-    if peso in df.columns:
-        w = _num(df[peso]).where(s.notna()).fillna(0)
+    s = df[col]
+    if peso and peso in df.columns:
+        w = df[peso].where(s.notna()).fillna(0)
         if w.sum() > 0:
             return float((s.fillna(0) * w).sum() / w.sum())
     return float(s.mean())
 
 
-def primeiro(df, col):
-    if col not in df.columns or df.empty:
-        return None
-    s = df[col].dropna()
-    return None if s.empty else s.iloc[0]
-
-
 def brl(v, casas=0):
-    if v is None:
-        return "—"
-    return f"R$ {v:,.{casas}f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    return "—" if v is None else f"R$ {v:,.{casas}f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
 def inteiro(v):
@@ -78,140 +71,150 @@ def _cor(v, amarelo, vermelho, maior_e_pior=True):
     return "vermelho" if v < vermelho else "amarelo" if v < amarelo else "verde"
 
 
-# ---------------- cards ----------------
-def card_mercado(mercado, categoria):
-    m = filtra(mercado, categoria=categoria)
-    pedidos = soma(m, "pedidos")
-    total = soma(mercado, "pedidos")
+# ---------------- 🏪 Mercado (gold_agg_mercado + gold_ref_rotas) ----------------
+def card_mercado(mercado, rotas, categoria):
+    base = janela(mercado)
+    m = filtra(base, categoria=categoria)
+    pedidos, total = soma(m, "pedidos"), soma(base, "pedidos")
+    meses = m["mes"].nunique() if "mes" in m.columns and not m.empty else None
     part = pedidos / total if pedidos is not None and total else None
-    ant, atual = soma(m, "pedidos_ano_anterior"), soma(m, "pedidos_ano_atual")
-    cresc = (atual / ant - 1) if ant and atual is not None else None
-    compradores = soma(m, "compradores")
-    # Se a tabela tiver uma linha por UF de destino, o mesmo vendedor se repete entre UFs: usa o máximo.
-    vendedores = (float(_num(m["vendedores"]).max()) if "uf_destino" in m.columns else soma(m, "vendedores")) \
-        if "vendedores" in m.columns and not m.empty else None
+
+    atual = soma(janela(m, *C.CRESC_ATUAL), "pedidos")
+    anterior = soma(janela(m, *C.CRESC_ANTERIOR), "pedidos")
+    cresc = (atual / anterior - 1) if atual is not None and anterior else None
 
     cor = _cor(part, C.MERCADO_PART_AMARELO, C.MERCADO_PART_VERMELHO, maior_e_pior=False)
     if cor == "verde" and cresc is not None and cresc < 0:
         cor = "amarelo"
-    linhas = [("Compradores", inteiro(compradores)), ("Vendedores", inteiro(vendedores))]
-    if "uf_destino" in m.columns and "pedidos" in m.columns and not m.empty:
-        top = m.assign(p=_num(m["pedidos"])).groupby("uf_destino")["p"].sum().nlargest(3).index
+
+    # vendedores_ativos é distinto por mês: somar meses contaria o mesmo vendedor várias vezes
+    vend_mes = media(m, "vendedores")
+    linhas = [("Pedidos por mês (média)", inteiro(pedidos / meses) if pedidos and meses else "—"),
+              ("Compradores únicos (soma mensal)", inteiro(soma(m, "compradores"))),
+              ("Vendedores ativos por mês (média)", inteiro(vend_mes))]
+    r = filtra(rotas, categoria=categoria)
+    if not r.empty and {"uf_destino", "pedidos"} <= set(r.columns):
+        top = r.groupby("uf_destino")["pedidos"].sum().nlargest(3).index
         linhas.append(("Maiores estados compradores", ", ".join(top)))
-    if part is not None:
-        linhas.append(("Participação no marketplace", pct(part, 1)))
-    return Card(cor, {"Pedidos": inteiro(pedidos), "Crescimento": "—" if cresc is None else f"{cresc:+.0%}"}, linhas)
+    linhas.append(("Participação no marketplace", pct(part, 1)))
+    return Card(cor, {"Pedidos": inteiro(pedidos), "Crescimento": "—" if cresc is None else f"{cresc:+.0%}"},
+                linhas, nota="Crescimento: jan–ago/2018 × jan–ago/2017")
 
 
+# ---------------- 🚚 Preço e frete (gold_agg_frete) ----------------
 def card_frete(frete, categoria, uf, preco):
-    f = filtra(frete, categoria=categoria)
-    f_uf = filtra(f, uf_origem=uf)
-    if not f_uf.empty:
-        f = f_uf
-    frete_medio = media(f, "frete_medio")
+    f_cat = filtra(frete, categoria=categoria)
+    f = filtra(f_cat, uf_origem=uf)
+    nota = f"Médias da categoria vendida a partir de {uf}"
+    if f.empty:
+        f, nota = f_cat, f"Sem vendas da categoria a partir de {uf}: média Brasil"
+    frete_medio = media(f, "frete_medio", "pedidos")
     pct_ticket = frete_medio / (preco + frete_medio) if frete_medio is not None else None
-    linhas = [("Ticket médio da categoria", brl(media(f, "ticket_medio"))),
-              ("Preço médio da categoria", brl(media(f, "preco_medio"))),
-              ("Peso médio", "—" if media(f, "peso_medio_g") is None else f"{inteiro(media(f, 'peso_medio_g'))} g"),
-              ("Parcelamento médio", "—" if media(f, "parcelas") is None else f"{dec(media(f, 'parcelas'))}x")]
+    peso = media(f, "peso_medio_g", "pedidos")
+    parc = media(f, "parcelas", "pedidos")
     return Card(_cor(pct_ticket, C.FRETE_AMARELO, C.FRETE_VERMELHO),
-                {"Frete médio": brl(frete_medio), "Do ticket": pct(pct_ticket)}, linhas)
+                {"Frete médio por item": brl(frete_medio), "Do ticket": pct(pct_ticket)},
+                [("Ticket médio por pedido (sem frete)", brl(media(f, "ticket_medio", "pedidos"))),
+                 ("Preço médio do item", brl(media(f, "preco_medio", "pedidos"))),
+                 ("Frete ÷ preço na categoria", pct(media(f, "frete_pct_preco", "pedidos"))),
+                 ("Peso médio", "—" if peso is None else f"{inteiro(peso)} g"),
+                 ("Parcelamento médio", "—" if parc is None else f"{dec(parc)}x"),
+                 ("Pedidos considerados", inteiro(soma(f, "pedidos")))],
+                nota=nota)
 
 
-def tabela_rotas(rotas, modelo, categoria, uf):
-    """UF de destino com taxa de atraso: modelo de ML se disponível, senão histórico da rota."""
-    r = filtra(rotas, uf_origem=uf).copy()
+# ---------------- ⏰ Risco de atraso (gold_ref_rotas) ----------------
+def tabela_rotas(rotas, categoria, uf):
+    """Rotas da UF de origem para a categoria. Com pouco histórico, usa todas as categorias da UF."""
+    r_uf = filtra(rotas, uf_origem=uf)
+    r = filtra(r_uf, categoria=categoria)
+    escopo = "categoria escolhida"
+    if (soma(r, "pedidos") or 0) < C.MIN_PEDIDOS_ROTA:
+        r, escopo = r_uf, "todas as categorias (pouco histórico na categoria)"
     if r.empty:
-        return r, "sem dados"
-    if "atrasos" in r.columns and "pedidos" in r.columns:
-        r["taxa"] = _num(r["atrasos"]) / _num(r["pedidos"]).replace(0, pd.NA)
-    elif "taxa_atraso" in r.columns:
-        r["taxa"] = _num(r["taxa_atraso"])
-    else:
-        r["taxa"] = pd.NA
-    fonte = "taxa histórica da rota"
-    if modelo is not None and {"uf_destino", "prob_atraso"} <= set(modelo.columns):
-        mm = filtra(filtra(modelo, uf_origem=uf), categoria=categoria)
-        if not mm.empty:
-            prob = mm.assign(p=_num(mm["prob_atraso"])).groupby("uf_destino")["p"].mean()
-            r["taxa"] = r["uf_destino"].map(prob).fillna(r["taxa"])
-            fonte = "modelo de ML"
-    if "regiao" not in r.columns:
-        r["regiao"] = r["uf_destino"].str.upper().map(C.UF_REGIAO)
-    return r, fonte
+        return r, escopo
+    r = r.groupby("uf_destino", as_index=False).agg(
+        pedidos=("pedidos", "sum"), atrasos=("atrasos", "sum"),
+        distancia_km=("distancia_km", lambda s: s.mean()))
+    r["taxa"] = r["atrasos"] / r["pedidos"].where(r["pedidos"] > 0)
+    r["regiao"] = r["uf_destino"].str.upper().map(C.UF_REGIAO)
+    return r, escopo
 
 
-def card_atraso(r, fonte):
+def card_atraso(r, escopo):
     if r.empty or r["taxa"].isna().all():
-        return Card("neutro", {}, [("Sem histórico para essa UF de origem", "—")])
-    w = _num(r["pedidos"]).fillna(1) if "pedidos" in r.columns else pd.Series(1, index=r.index)
-    r = r.assign(w=w, tw=_num(r["taxa"]) * w)
-    g = r.dropna(subset=["taxa"]).groupby("regiao")[["tw", "w"]].sum()
-    por_regiao = (g["tw"] / g["w"]).reindex([x for x in C.ORDEM_REGIOES if x in g.index] +
-                                            [x for x in g.index if x not in C.ORDEM_REGIOES])
+        return Card("neutro", {}, [("Sem histórico de entregas para essa UF de origem", "—")])
+    g = r.dropna(subset=["taxa", "regiao"]).groupby("regiao")[["atrasos", "pedidos"]].sum()
+    por_regiao = (g["atrasos"] / g["pedidos"]).reindex([x for x in C.ORDEM_REGIOES if x in g.index])
     linhas = [(reg, pct(v), _cor(v, C.ATRASO_AMARELO, C.ATRASO_VERMELHO)) for reg, v in por_regiao.items()]
-    dist = media(r, "distancia_km")
-    metr = {"Pedidos na origem": inteiro(soma(r, "pedidos")), "Distância média": "—" if dist is None else f"{inteiro(dist)} km"}
-    return Card(_cor(por_regiao.max(), C.ATRASO_AMARELO, C.ATRASO_VERMELHO), metr, linhas,
-                pill=f"Fonte: {fonte}")
+    taxa_geral = soma(r, "atrasos") / soma(r, "pedidos") if soma(r, "pedidos") else None
+    return Card(_cor(por_regiao.max(), C.ATRASO_AMARELO, C.ATRASO_VERMELHO),
+                {"Taxa de atraso": pct(taxa_geral, 1), "Distância média": f"{inteiro(media(r, 'distancia_km', 'pedidos'))} km"},
+                linhas, nota=f"Taxa histórica de atraso · {escopo} · {inteiro(soma(r, 'pedidos'))} pedidos entregues")
 
 
+# ---------------- ⭐ Reputação (gold_agg_reputacao) ----------------
 def card_reputacao(reput, categoria):
     r = filtra(reput, categoria=categoria)
-    nota = media(r, "nota_media", peso="avaliacoes" if "avaliacoes" in r.columns else "pedidos")
+    nota = media(r, "nota_media", "avaliacoes")
     aval, neg = soma(r, "avaliacoes"), soma(r, "avaliacoes_negativas")
     pneg = neg / aval if aval and neg is not None else media(r, "pct_negativas")
-    if pneg is not None and pneg > 1:   # veio em 0-100
-        pneg = pneg / 100
+    queixa = r["reclamacao_top"].dropna().iloc[0] if "reclamacao_top" in r.columns and r["reclamacao_top"].notna().any() else "—"
+    if str(queixa).lower().startswith("outros"):
+        queixa = "Não identificada no texto"
     return Card(_cor(nota, C.NOTA_AMARELO, C.NOTA_VERMELHO, maior_e_pior=False),
-                {"Nota média": dec(nota), "Avaliações negativas": pct(pneg)},
-                [("Total de avaliações", inteiro(aval)),
-                 ("Avaliações 1-2", inteiro(neg)),
-                 ("Reclamação mais comum", primeiro(r, "reclamacao_top") or "—")])
+                {"Nota média": dec(nota), "Notas 1-2": pct(pneg)},
+                [("Total de avaliações", inteiro(aval)), ("Avaliações com nota 1 ou 2", inteiro(neg)),
+                 ("Queixa mais comum", queixa)])
 
 
+# ---------------- 🏷️ Categoria (gold_agg_categoria) ----------------
 def card_categoria(categ, categoria, preco):
-    c = filtra(categ, categoria=categoria)
-    medio, mediano = media(c, "preco_medio", peso="volume"), media(c, "preco_mediano", peso="volume")
-    pmin = float(_num(c["preco_min"]).min()) if "preco_min" in c.columns and not c.empty else None
-    pmax = float(_num(c["preco_max"]).max()) if "preco_max" in c.columns and not c.empty else None
+    c = filtra(janela(categ), categoria=categoria)
+    medio = media(c, "preco_medio", "itens")
+    mediano = media(c, "preco_mediano", "itens")     # média ponderada das medianas mensais
+    pmin = float(c["preco_min"].min()) if "preco_min" in c.columns and not c.empty else None
+    pmax = float(c["preco_max"].max()) if "preco_max" in c.columns and not c.empty else None
     if pmin is not None and preco < pmin:
-        pos = "Abaixo do mínimo"
+        pos = "abaixo do mínimo"
     elif pmax is not None and preco > pmax:
-        pos = "Acima do máximo"
+        pos = "acima do máximo"
     elif mediano is not None:
-        pos = "Abaixo da mediana" if preco < mediano else "Acima da mediana"
+        pos = "abaixo da mediana" if preco < mediano else "acima da mediana"
     else:
         pos = None
-    return Card("neutro", {"Preço médio": brl(medio, 2), "Preço mediano": brl(mediano, 2)},
+    return Card("neutro", {"Preço médio": brl(medio, 2), "Preço mediano (aprox.)": brl(mediano, 2)},
                 [("Preço mínimo", brl(pmin, 2)), ("Preço máximo", brl(pmax, 2)),
-                 ("Volume", inteiro(soma(c, "volume")))],
-                pill=f"Seu preço: {pos}" if pos else None)
+                 ("Pedidos", inteiro(soma(c, "pedidos"))), ("Itens vendidos", inteiro(soma(c, "itens")))],
+                pill=f"Seu preço: {pos}" if pos else None,
+                nota="Mediana aproximada: média ponderada das medianas mensais")
 
 
 # ---------------- semáforo e textos ----------------
-def semaforo_geral(cards: dict):
-    avaliados = {k: v for k, v in cards.items() if v.cor != "neutro"}
-    pontos = sum(C.PONTOS[c.cor] for c in avaliados.values())
-    alertas = [k for k, c in avaliados.items() if c.cor != "verde"]
+SINAIS = ("mercado", "frete", "atraso", "reputacao")
+
+
+def semaforo_geral(cards):
+    av = {k: cards[k] for k in SINAIS if cards[k].cor != "neutro"}
+    pontos = sum(C.PONTOS[c.cor] for c in av.values())
+    alertas = [k for k, c in av.items() if c.cor != "verde"]
     if pontos >= C.GERAL_VERMELHO:
         return "vermelho", pontos, "Inviável no cenário atual"
-    if pontos >= C.GERAL_AMARELO or any(c.cor == "vermelho" for c in avaliados.values()):
-        return "amarelo", pontos, f"Atenção: viável, com {len(alertas)} alerta{'s' if len(alertas) > 1 else ''}"
+    if pontos >= C.GERAL_AMARELO or any(c.cor == "vermelho" for c in av.values()):
+        return "amarelo", pontos, f"Atenção: viável, com {len(alertas)} alerta{'s' if len(alertas) != 1 else ''}"
     return "verde", pontos, "Viável: combinação saudável"
 
 
-def resumo(cards: dict) -> str:
+def _regioes(card, cor):
+    return [l[0] for l in card.linhas if len(l) == 3 and l[2] == cor]
+
+
+def resumo(cards):
     partes = []
     if cards["frete"].cor in ("amarelo", "vermelho"):
         partes.append("frete alto para o ticket")
-    criticas = [
-        linha[0]
-        for linha in cards["atraso"].linhas
-        if len(linha) == 3 and linha[2] == "vermelho"
-    ]
-    if criticas:
-        partes.append(f"risco de atraso para {', '.join(criticas)}")
+    if _regioes(cards["atraso"], "vermelho"):
+        partes.append(f"risco de atraso para {', '.join(_regioes(cards['atraso'], 'vermelho'))}")
     elif cards["atraso"].cor == "amarelo":
         partes.append("risco de atraso moderado em algumas regiões")
     if cards["reputacao"].cor in ("amarelo", "vermelho"):
@@ -224,21 +227,12 @@ def resumo(cards: dict) -> str:
     return txt[0].upper() + txt[1:]
 
 
-def recomendacoes(cards: dict) -> list[str]:
+def recomendacoes(cards):
     recs = []
-    linhas = [
-        linha for linha in cards["atraso"].linhas
-        if len(linha) == 3
-    ]
-    criticas = [
-        linha[0] for linha in linhas
-        if linha[2] == "vermelho"
-    ]
+    criticas, boas = _regioes(cards["atraso"], "vermelho"), _regioes(cards["atraso"], "verde")
     if criticas:
-        boas = [
-            linha[0] for linha in linhas
-            if linha[2] == "verde"
-        ]
+        recs.append(f"Anuncie prazo maior para {', '.join(criticas)}"
+                    + (f" ou priorize {' e '.join(boas)} na divulgação" if boas else ""))
     if cards["frete"].cor in ("amarelo", "vermelho"):
         recs.append("Venda em kit para diluir o frete no ticket")
     if cards["reputacao"].cor in ("amarelo", "vermelho"):
@@ -246,9 +240,9 @@ def recomendacoes(cards: dict) -> list[str]:
     if cards["mercado"].cor in ("amarelo", "vermelho"):
         recs.append("Mercado pequeno ou em queda: teste com estoque reduzido antes de escalar")
     pill = cards["categoria"].pill or ""
-    if "Acima do máximo" in pill:
+    if "acima do máximo" in pill:
         recs.append("Seu preço está acima do máximo praticado na categoria: revise o posicionamento")
-    elif "Abaixo do mínimo" in pill:
+    elif "abaixo do mínimo" in pill:
         recs.append("Seu preço está abaixo do mínimo da categoria: confira se a margem cobre o frete")
     recs.append("Poste dentro do prazo limite: é a etapa que você controla")
     return recs

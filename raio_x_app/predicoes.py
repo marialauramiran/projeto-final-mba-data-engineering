@@ -1,8 +1,14 @@
 """Analisa a base `predictions` (Volume ml_predictions) e roda o modelo de ML para prever o risco do cenário.
-
 Fluxo: lê a base -> filtra o cenário (categoria, UF, preço, peso) -> monta as features dos pedidos
 -> chama o modelo (Model Serving) -> calcula risco médio, % de alto risco e nº de pedidos.
 Se o endpoint não estiver configurado ou falhar, usa as probabilidades já gravadas na base.
+
+Classificação de risco: usa as faixas que o modelo gravou na Gold (coluna `nivel_risco`).
+Faixas atuais na base (32.450 pedidos de teste):
+    baixo  ->  0,2% a  7,3%  · atraso real  2,7%  · 19.470 pedidos
+    medio  ->  7,3% a 13,6%  · atraso real  6,9%  ·  9.735 pedidos
+    alto   -> 13,6% a 45,5%  · atraso real 16,2%  ·  3.245 pedidos
+Os limites são lidos da própria base a cada carga; os valores abaixo só são usados se a coluna não existir.
 """
 import io
 import json
@@ -19,6 +25,13 @@ MAX_CENARIO = 1000    # máx. de pedidos do cenário enviados ao modelo (amostra
 MAX_CATEGORIA = 500   # amostra da categoria inteira, usada como referência de comparação
 LOTE = 250            # registros por chamada ao endpoint
 
+# Faixas de risco do modelo (Gold, coluna nivel_risco) -> rótulo e cor do card
+NIVEIS = {"baixo": ("Baixo", "verde"), "medio": ("Moderado", "amarelo"), "médio": ("Moderado", "amarelo"),
+          "moderado": ("Moderado", "amarelo"), "alto": ("Alto", "vermelho")}
+ORDEM_NIVEIS = ["baixo", "medio", "alto"]
+# Início de cada faixa (probabilidade 0–1). Reserva, caso a base não tenha nivel_risco.
+FAIXAS_PADRAO = {"baixo": 0.0, "medio": 0.073, "alto": 0.136}
+
 # Nomes possíveis das colunas (a primeira que existir é usada).
 COLUNAS = {
     "categoria": ["categoria", "product_category_name_english", "product_category_name"],
@@ -31,7 +44,8 @@ COLUNAS = {
 }
 # Colunas que NÃO são features do modelo (só usadas se a base não tiver inputs_json)
 META = {"prediction_id", "order_id", "pedido_id", "probability", "predicted_label", "actual_label", "threshold",
-        "prediction_type", "model_name", "model_version", "prediction_timestamp", "inputs_json", "outputs_json"}
+        "prediction_type", "model_name", "model_version", "prediction_timestamp", "inputs_json", "outputs_json",
+        "nivel_risco"}
 
 
 def _col(df: pd.DataFrame, chave: str):
@@ -80,6 +94,36 @@ def carregar_predictions() -> pd.DataFrame:
     raise FileNotFoundError(" | ".join(erros))
 
 
+# ---------------- Faixas de risco da Gold ----------------
+def _risco(serie: pd.Series) -> pd.Series:
+    r = serie.astype(float)
+    return r / 100 if r.max() > 1 else r  # aceita escala 0–1 ou 0–100
+
+
+def _nivel_pedidos(frame: pd.DataFrame) -> pd.Series:
+    """Faixa de cada pedido, normalizada (baixo / medio / alto)."""
+    return (frame["nivel_risco"].astype(str).str.strip().str.lower()
+            .replace({"médio": "medio", "moderado": "medio"}))
+
+
+def faixas_gold(base: pd.DataFrame, col_prob: str | None) -> dict:
+    """Início de cada faixa (menor probabilidade de cada nivel_risco). Ex.: {'baixo':0.002,'medio':0.073,'alto':0.136}"""
+    if col_prob and "nivel_risco" in base.columns:
+        inicio = _risco(base[col_prob]).groupby(_nivel_pedidos(base)).min().to_dict()
+        if inicio:
+            return {k: inicio[k] for k in ORDEM_NIVEIS if k in inicio} or inicio
+    return dict(FAIXAS_PADRAO)
+
+
+def classificar(prob: float, faixas: dict) -> str:
+    """Encaixa uma probabilidade na faixa da Gold (a maior faixa cujo início é <= prob)."""
+    nivel = min(faixas, key=faixas.get)
+    for nome, inicio in sorted(faixas.items(), key=lambda x: x[1]):
+        if prob >= inicio:
+            nivel = nome
+    return nivel
+
+
 # ---------------- Modelo de ML (Model Serving) ----------------
 def _features(frame: pd.DataFrame) -> pd.DataFrame:
     """Features exatamente como o modelo recebeu na predição gravada (inputs_json); senão, colunas não-meta."""
@@ -120,11 +164,6 @@ def prever_modelo(frame: pd.DataFrame) -> pd.Series:
 
 
 # ---------------- Indicadores ----------------
-def _risco(serie: pd.Series) -> pd.Series:
-    r = serie.astype(float)
-    return r / 100 if r.max() > 1 else r  # aceita escala 0–1 ou 0–100
-
-
 def _amostra(frame: pd.DataFrame, n: int) -> pd.DataFrame:
     return frame if len(frame) <= n else frame.sample(n, random_state=0)
 
@@ -143,24 +182,29 @@ def calcular_cenario(_df, categoria, uf, preco_min, preco_max, peso_min, peso_ma
     if f.empty:
         return {"pedidos": 0, "base": len(_df)}
 
+    faixas = faixas_gold(_df, c["risco"])           # limites das faixas, lidos da Gold
+    inicio_alto = faixas.get("alto", FAIXAS_PADRAO["alto"])
     thr = float(f["threshold"].median()) if "threshold" in f.columns and f["threshold"].notna().any() else LIMIAR_ALTO
 
-    # 1) Plano B: probabilidades já gravadas na base
+    # 1) Probabilidades já gravadas na base (Gold)
     fonte, aviso, amostra = "probabilidades gravadas na base", None, len(f)
     if c["risco"]:
         risco = _risco(f[c["risco"]])
-        alto = f[c["alto"]].astype(bool) if c["alto"] else risco >= thr
+        if "nivel_risco" in f.columns:
+            alto = _nivel_pedidos(f).eq("alto")      # pedidos na faixa alta do modelo
+        else:
+            alto = risco >= inicio_alto
         risco_cat = float(_risco(base_cat[c["risco"]]).mean())
     else:
         risco, alto, risco_cat = None, None, None
 
-    # 2) Modelo de ML ao vivo
+    # 2) Modelo de ML ao vivo (opcional): mesmas faixas da Gold
     if ENDPOINT:
         try:
             am = _amostra(f, MAX_CENARIO)
             r_live = _risco(prever_modelo(am))
             cat_live = float(_risco(prever_modelo(_amostra(base_cat, MAX_CATEGORIA))).mean())
-            risco, alto, risco_cat = r_live, r_live >= thr, cat_live
+            risco, alto, risco_cat = r_live, r_live >= inicio_alto, cat_live
             fonte, amostra = f"modelo de ML ao vivo ({ENDPOINT})", len(am)
         except Exception as e:  # noqa: BLE001
             aviso = f"{type(e).__name__}: {e}"
@@ -170,15 +214,14 @@ def calcular_cenario(_df, categoria, uf, preco_min, preco_max, peso_min, peso_ma
         raise RuntimeError(f"não foi possível prever o risco: {aviso}")
 
     medio, pct = float(risco.mean()), float(alto.mean())
-    nivel, cor = (("Alto", "vermelho") if medio >= 0.4 or pct >= 0.35 else
-                  ("Moderado", "amarelo") if medio >= 0.2 or pct >= 0.15 else
-                  ("Baixo", "verde"))
+    faixa = classificar(medio, faixas)                # risco médio do cenário na faixa da Gold
+    nivel, cor = NIVEIS.get(faixa, (faixa.capitalize(), "amarelo"))
     nome = f["model_name"].dropna() if "model_name" in f.columns else []
     return {
         "pedidos": int(f[c["pedido"]].nunique()) if c["pedido"] else len(f),
         "risco_medio": medio, "pct_alto": pct, "nivel": nivel, "cor": cor, "risco_categoria": risco_cat,
         "fonte": fonte, "aviso": aviso, "amostra": amostra, "base": len(_df), "limiar": thr,
-        "modelo_base": str(nome.mode().iloc[0]) if len(nome) else None,
+        "faixas": faixas, "modelo_base": str(nome.mode().iloc[0]) if len(nome) else None,
     }
 
 
@@ -188,11 +231,15 @@ def recomendacoes_cenario(ind: dict) -> list:
     recs = []
     if ind["nivel"] == "Alto":
         recs.append("Risco de atraso elevado neste cenário: revise o prazo prometido e a transportadora.")
-    if ind["pct_alto"] >= 0.15:
-        recs.append(f"{fmt_pct(ind['pct_alto'])} dos pedidos são de alto risco: acrescente margem no prazo de entrega.")
+    elif ind["nivel"] == "Moderado":
+        recs.append("Risco de atraso moderado: acompanhe a postagem e evite prometer prazos curtos.")
+    # Na base inteira, 10% dos pedidos estão na faixa alta; acima disso o cenário merece atenção.
+    if ind["pct_alto"] >= 0.10:
+        recs.append(f"{fmt_pct(ind['pct_alto'])} dos pedidos estão na faixa de alto risco do modelo: "
+                    "acrescente margem no prazo de entrega.")
     if ind.get("risco_categoria") is not None:
         dif = ind["risco_medio"] - ind["risco_categoria"]
-        if abs(dif) >= 0.02:
+        if abs(dif) >= 0.01:
             recs.append(f"Risco médio {'acima' if dif > 0 else 'abaixo'} da média da categoria "
                         f"({fmt_pct(ind['risco_categoria'])}) em {abs(dif) * 100:.1f} p.p.".replace(".", ",", 1))
     if ind["nivel"] == "Baixo":
@@ -205,7 +252,14 @@ def recomendacoes_cenario(ind: dict) -> list:
 def rodape_cenario(ind: dict) -> str:
     if not ind or ind["pedidos"] == 0:
         return f"Base analisada: {fmt_int((ind or {}).get('base', 0))} registros"
+    fx = ind.get("faixas") or {}
+    faixas_txt = ""
+    if {"medio", "alto"} <= set(fx):
+        faixas_txt = (f"faixas do modelo: baixo < {fmt_pct(fx['medio'])} ≤ moderado < "
+                      f"{fmt_pct(fx['alto'])} ≤ alto")
     partes = [f"Predição: {ind['fonte']}", f"base analisada: {fmt_int(ind['base'])} registros"]
+    if faixas_txt:
+        partes.append(faixas_txt)
     if ind["amostra"] < ind["pedidos"]:
         partes.append(f"modelo aplicado a amostra de {fmt_int(ind['amostra'])} de {fmt_int(ind['pedidos'])} pedidos")
     return " · ".join(partes)
@@ -215,5 +269,5 @@ def fmt_pct(x: float) -> str:
     return f"{x:.1%}".replace(".", ",")
 
 
-def fmt_int(n: int) -> str:
-    return f"{n:,}".replace(",", ".")
+def fmt_int(n) -> str:
+    return f"{int(n):,}".replace(",", ".")

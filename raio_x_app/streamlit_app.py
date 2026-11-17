@@ -1,17 +1,18 @@
 """Raio-X do Vendedor — app Streamlit lendo a camada Gold (Parquet) do Volume do Databricks."""
 import html
 
-import pandas as pd
 import streamlit as st
 
 from predicoes import (BASE_PRED, calcular_cenario, carregar_predictions, fmt_int, fmt_pct,
                        recomendacoes_cenario, rodape_cenario)
 from src import config as C
 from src.dados import TabelaNaoEncontrada, carregar, diagnostico
+from src.formatacao import nome_categoria
 from src.regras import (card_atraso, card_categoria, card_frete, card_mercado, card_reputacao,
                         recomendacoes, resumo, semaforo_geral, tabela_rotas)
 
 st.set_page_config(page_title="Raio-X do Vendedor", page_icon="🔎", layout="centered")
+
 
 # ---------------- Tema (claro / escuro) ----------------
 def _tema_escuro() -> bool:
@@ -22,7 +23,6 @@ def _tema_escuro() -> bool:
 
 
 ESCURO = _tema_escuro()
-# cor: (fundo da pílula, texto da pílula, destaque/borda)
 CORES = ({"verde": ("#1E3A1A", "#9FD88A", "#5FAE45"), "amarelo": ("#3D3216", "#F0C66B", "#D6A13A"),
           "vermelho": ("#45201E", "#F4A19C", "#E0625C"), "neutro": ("#1C2C45", "#9CC3F5", "#5B9DF0")}
          if ESCURO else
@@ -39,67 +39,32 @@ ROTULO = {"verde": "Verde", "amarelo": "Amarelo", "vermelho": "Vermelho", "neutr
 
 st.markdown(f"""<style>
 :root {{
-    --rx-card: {PALETA['card']};
-    --rx-borda: {PALETA['borda']};
-    --rx-linha: {PALETA['linha']};
-    --rx-texto: {PALETA['texto']};
-    --rx-suave: {PALETA['suave']};
-    --rx-fraco: {PALETA['fraco']};
-    --rx-apagado: {PALETA['apagado']};
-    --rx-sombra: {PALETA['sombra']};
+    --rx-card: {PALETA['card']}; --rx-borda: {PALETA['borda']}; --rx-linha: {PALETA['linha']};
+    --rx-texto: {PALETA['texto']}; --rx-suave: {PALETA['suave']}; --rx-fraco: {PALETA['fraco']};
+    --rx-apagado: {PALETA['apagado']}; --rx-sombra: {PALETA['sombra']};
 }}
-
-/* 1. Esconde a barra superior nativa do Streamlit para não brigar com a barra do Databricks */
-header[data-testid="stHeader"],
-div[data-testid="stToolbar"],
-div[data-testid="stDecoration"] {{
-    display: none !important;
-    height: 0 !important;
+header[data-testid="stHeader"], div[data-testid="stToolbar"], div[data-testid="stDecoration"] {{
+    display: none !important; height: 0 !important;
 }}
-
-/* 2. Força o respiro no topo em todas as versões do Streamlit (antigas e novas) */
-.stApp,
-[data-testid="stAppViewContainer"],
-[data-testid="stMain"],
-[data-testid="stMainBlockContainer"],
-[data-testid="stAppViewBlockContainer"],
-.block-container {{
-    padding-top: 2.5rem !important;
-    margin-top: 0 !important;
-}}
-
-.block-container,
-[data-testid="stMainBlockContainer"] {{
-    max-width: 880px !important;
-    padding-bottom: 2.5rem !important;
-}}
-
-/* 3. Garante que o header do app tenha espaço extra e nunca corte */
-.rx-head {{
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    flex-wrap: wrap;
-    margin: 1rem 0 1.2rem 0 !important;
-    padding-top: 0.5rem !important;
-    line-height: 1.4 !important;
-}}
+.stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"], [data-testid="stMainBlockContainer"],
+[data-testid="stAppViewBlockContainer"], .block-container {{ padding-top: 2.5rem !important; margin-top: 0 !important; }}
+.block-container, [data-testid="stMainBlockContainer"] {{ max-width: 880px !important; padding-bottom: 2.5rem !important; }}
+.rx-head {{ display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 1rem 0 1.2rem 0 !important;
+           padding-top: 0.5rem !important; line-height: 1.4 !important; }}
 .rx-head .t {{ font-size: 22px; font-weight: 600; color: var(--rx-texto); }}
 .rx-head .s {{ margin-left: auto; font-size: 12px; color: var(--rx-fraco); }}
-
-/* 4. Estilos dos cards e indicadores */
-.rx-card {{
-    background: var(--rx-card); border: 1px solid var(--rx-borda); border-radius: 12px;
-    padding: 16px 18px; margin-bottom: 14px; box-shadow: var(--rx-sombra); color: var(--rx-texto);
-}}
-.rx-top {{ display: flex; align-items: center; justify-content: space-between; font-weight: 600; font-size: 15px; margin-bottom: 12px; }}
-.rx-pill {{ padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }}
-.rx-mets {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 10px; }}
+.rx-card {{ background: var(--rx-card); border: 1px solid var(--rx-borda); border-radius: 12px;
+           padding: 16px 18px; margin-bottom: 14px; box-shadow: var(--rx-sombra); color: var(--rx-texto); }}
+.rx-top {{ display: flex; align-items: center; justify-content: space-between; gap: 8px; font-weight: 600;
+          font-size: 15px; margin-bottom: 12px; }}
+.rx-pill {{ padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; white-space: nowrap; }}
+.rx-mets {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 12px; margin-bottom: 10px; }}
 .rx-lbl {{ margin: 0; font-size: 12px; color: var(--rx-fraco); }}
 .rx-met {{ margin: 2px 0 0; font-size: 22px; font-weight: 700; color: var(--rx-texto); }}
 .rx-sub {{ margin: 4px 0 0; font-size: 13px; color: var(--rx-suave); }}
 .rx-dot {{ display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 4px; }}
-.rx-row {{ display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-top: 1px solid var(--rx-linha); font-size: 14px; }}
+.rx-row {{ display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 8px 0;
+          border-top: 1px solid var(--rx-linha); font-size: 14px; }}
 .rx-foot {{ margin-top: 10px; padding-top: 8px; border-top: 1px dashed var(--rx-linha); font-size: 11px; color: var(--rx-fraco); }}
 </style>""", unsafe_allow_html=True)
 
@@ -109,19 +74,35 @@ def pill(cor, texto=None):
     return f'<span class="rx-pill" style="background:{bg};color:{fg}">{html.escape(texto or ROTULO[cor])}</span>'
 
 
-def render(icone, titulo, card, rodape=None):
+def render(icone, titulo, card, fonte):
     mets = "".join(f'<div><p class="rx-lbl">{html.escape(k)}</p><p class="rx-met">{html.escape(str(v))}</p></div>'
                    for k, v in card.metricas.items())
     linhas = ""
     for l in card.linhas:
         valor = pill(l[2], str(l[1])) if len(l) == 3 else html.escape(str(l[1]))
         linhas += f'<div class="rx-row"><span>{html.escape(str(l[0]))}</span><span>{valor}</span></div>'
-    topo_pill = pill("neutro", card.pill) if card.cor == "neutro" and card.pill else pill(card.cor)
-    foot = f'<div class="rx-foot">{html.escape(rodape)}</div>' if rodape else ""
-    st.markdown(f'<div class="rx-card"><div class="rx-top"><span>{icone} {titulo}</span>{topo_pill}</div>'
-                + (f'<div class="rx-mets">{mets}</div>' if mets else "") + linhas + foot + "</div>",
-                unsafe_allow_html=True)
+    topo = pill("neutro", card.pill) if card.cor == "neutro" and card.pill else pill(card.cor)
+    rodape = " · ".join(x for x in (card.nota, f"Fonte: {fonte}") if x)
+    st.markdown(f'<div class="rx-card"><div class="rx-top"><span>{icone} {html.escape(titulo)}</span>{topo}</div>'
+                + (f'<div class="rx-mets">{mets}</div>' if mets else "") + linhas
+                + f'<div class="rx-foot">{html.escape(rodape)}</div></div>', unsafe_allow_html=True)
 
+
+def mostrar_diagnostico():
+    for item in diagnostico():
+        with st.expander(f"{item['tabela']} · {item['status']}"):
+            st.write(f"**Linhas:** {fmt_int(item['linhas'])}")
+            st.write(f"**Faltando (app → Gold):** {item['faltando']}")
+            st.caption(f"Colunas na tabela: {item['colunas']}")
+
+
+# ---------------- Diagnóstico (barra lateral, sempre disponível) ----------------
+with st.sidebar:
+    st.subheader("🔧 Diagnóstico dos dados")
+    st.caption(f"Gold: {C.BASE_PATH}")
+    st.caption(f"Predições: {BASE_PRED}")
+    if st.toggle("Mostrar colunas das tabelas", value=False):
+        mostrar_diagnostico()
 
 # ---------------- Dados (Volume do Databricks) ----------------
 try:
@@ -130,10 +111,9 @@ try:
     rotas = carregar(C.T_ROTAS)
     reputacao = carregar(C.T_REPUTACAO)
     categorias_df = carregar(C.T_CATEGORIA)
-    modelo = carregar(C.T_MODELO, obrigatoria=False)   # em desenvolvimento
 except TabelaNaoEncontrada as e:
     st.error(f"{e}. Confira o caminho {C.BASE_PATH} e as permissões do app no Volume.")
-    st.dataframe(pd.DataFrame(diagnostico()), hide_index=True)
+    mostrar_diagnostico()
     st.stop()
 except Exception as e:  # noqa: BLE001
     st.error(f"Não consegui acessar {C.BASE_PATH}: {e}")
@@ -141,34 +121,41 @@ except Exception as e:  # noqa: BLE001
     st.stop()
 
 st.markdown('<div class="rx-head"><span style="font-size:22px">🔎</span><span class="t">Raio-X do vendedor</span>'
-            '<span class="s">Dados Olist · camada Gold</span></div>', unsafe_allow_html=True)
+            '<span class="s">Dados Olist jan/2017–ago/2018 · camada Gold</span></div>', unsafe_allow_html=True)
 
 # ---------------- Entradas ----------------
-cats = sorted(set().union(*[set(d["categoria"].dropna()) for d in (mercado, categorias_df, reputacao, frete)
-                            if "categoria" in d.columns]))
+# Valor interno = nome original da Gold (usado nos filtros); a tela mostra o nome amigável.
+cats = sorted(set(categorias_df.get("categoria", []).dropna()) | set(mercado.get("categoria", []).dropna()),
+              key=nome_categoria)
 ufs = sorted(rotas["uf_origem"].dropna().unique()) if "uf_origem" in rotas.columns else []
 if not cats or not ufs:
-    st.error("Não encontrei a coluna de categoria ou de UF de origem. Ajuste o mapeamento em src/config.py.")
-    st.dataframe(pd.DataFrame(diagnostico()), hide_index=True)
+    if not cats:
+        st.error("Coluna de categoria não encontrada (esperado: category). Ajuste src/config.py.")
+    if not ufs:
+        st.error(f"Coluna uf_origem não encontrada em {C.T_ROTAS}. Colunas lidas: {list(rotas.columns)}")
+    mostrar_diagnostico()
     st.stop()
 
 with st.form("entradas", border=False):
     c1, c2 = st.columns([2.2, 1])
-    categoria = c1.selectbox("Categoria", cats)
+    categoria = c1.selectbox("Categoria", cats, format_func=nome_categoria)
     uf = c2.selectbox("UF de origem", ufs, index=ufs.index("SP") if "SP" in ufs else 0)
     c3, c4, c5, c6, c7 = st.columns([1, 1, 1, 1, 1.2], vertical_alignment="bottom")
-    preco = c3.number_input("Preço mín. (R$)", min_value=1.0, max_value=50000.0, value=60.0, step=5.0, format="%.2f")
+    preco = c3.number_input("Preço mín. (R$)", min_value=1.0, max_value=50000.0, value=60.0, step=5.0, format="%.2f",
+                            help="Usado como preço do produto nos cards Preço e frete e Categoria.")
     preco_max = c4.number_input("Preço máx. (R$)", min_value=1.0, max_value=50000.0, value=50000.0, step=5.0, format="%.2f")
     peso = c5.number_input("Peso mín. (g)", min_value=1, max_value=40000, value=400, step=50)
     peso_max = c6.number_input("Peso máx. (g)", min_value=1, max_value=40000, value=40000, step=50)
     c7.form_submit_button("Gerar raio-x", type="primary", use_container_width=True)
 
+categoria_tela = nome_categoria(categoria)
+
 # ---------------- Cards ----------------
-rotas_uf, fonte_risco = tabela_rotas(rotas, modelo, categoria, uf)
+rotas_uf, escopo_rotas = tabela_rotas(rotas, categoria, uf)
 cards = {
-    "mercado": card_mercado(mercado, categoria),
+    "mercado": card_mercado(mercado, rotas, categoria),
     "frete": card_frete(frete, categoria, uf, preco),
-    "atraso": card_atraso(rotas_uf, fonte_risco),
+    "atraso": card_atraso(rotas_uf, escopo_rotas),
     "reputacao": card_reputacao(reputacao, categoria),
     "categoria": card_categoria(categorias_df, categoria, preco),
 }
@@ -184,13 +171,12 @@ st.markdown(f'<div class="rx-card" style="display:flex;align-items:center;gap:14
 
 col1, col2 = st.columns(2)
 with col1:
-    render("🏪", "Mercado", cards["mercado"], f"Fonte: {C.T_MERCADO}")
-    render("⏰", "Risco de atraso", cards["atraso"],
-           f"Fonte: {C.T_ROTAS}" + (f" + {C.T_MODELO}" if fonte_risco == "modelo de ML" else " · modelo de ML em desenvolvimento"))
+    render("🏪", "Mercado", cards["mercado"], f"{C.T_MERCADO} + {C.T_ROTAS}")
+    render("⏰", "Risco de atraso", cards["atraso"], C.T_ROTAS)
 with col2:
-    render("🚚", "Preço e frete", cards["frete"], f"Fonte: {C.T_FRETE} · peso informado: {peso} g")
-    render("⭐", "Reputação", cards["reputacao"], f"Fonte: {C.T_REPUTACAO}")
-render("🏷️", f"Categoria · {categoria}", cards["categoria"], f"Fonte: {C.T_CATEGORIA}")
+    render("🚚", "Preço e frete", cards["frete"], C.T_FRETE)
+    render("⭐", "Reputação", cards["reputacao"], C.T_REPUTACAO)
+render("🏷️", f"Categoria · {categoria_tela}", cards["categoria"], C.T_CATEGORIA)
 
 # ---------------- Predições do cenário (Volume ml_predictions) ----------------
 ind, recs_pred = None, []
@@ -202,9 +188,6 @@ else:
         recs_pred = recomendacoes_cenario(ind)
     except Exception as e:  # noqa: BLE001
         st.warning(f"Não consegui consultar predictions em {BASE_PRED}: {e}")
-
-if ind and ind.get("aviso"):
-    st.info(f"Modelo de ML não utilizado ({ind['aviso']}). Exibindo as probabilidades gravadas na base.")
 
 if ind is not None:
     if ind["pedidos"] == 0:
@@ -218,18 +201,12 @@ if ind is not None:
         corpo = '<div class="rx-mets">' + "".join(
             f'<div><p class="rx-lbl">{k}</p><p class="rx-met">{v}</p></div>' for k, v in mets) + "</div>"
     st.markdown(f'<div class="rx-card"><div class="rx-top"><span>📈 Predições do cenário</span>{topo}</div>{corpo}'
-                f'<div class="rx-foot">{html.escape(rodape_cenario(ind))} · {html.escape(categoria)} · {html.escape(str(uf))} · '
+                f'<div class="rx-foot">{html.escape(rodape_cenario(ind))} · {html.escape(categoria_tela)} · {html.escape(str(uf))} · '
                 f'R$ {preco:,.2f}–{preco_max:,.2f} · {peso}–{peso_max} g</div></div>', unsafe_allow_html=True)
+    if ind.get("aviso") and ind["pedidos"]:
+        st.caption(f"Predição feita com as probabilidades gravadas na base ({ind['aviso']}).")
 
 recs = "".join(f'<div class="rx-row"><span>{html.escape(r)}</span></div>'
                for r in list(recomendacoes(cards)) + recs_pred)
 st.markdown(f'<div class="rx-card"><p style="font-weight:500;margin:0 0 8px">💡 Recomendações</p>{recs}</div>',
             unsafe_allow_html=True)
-
-with st.expander("Diagnóstico dos dados (para ajustar o mapeamento de colunas)"):
-    st.caption(f"Caminho: {C.BASE_PATH}")
-    st.table(pd.DataFrame(diagnostico()))
-    st.caption(f"Predições: {BASE_PRED}")
-    if ind and ind["pedidos"]:
-        st.caption(f"Fonte da predição: {ind['fonte']} · limiar de alto risco: {ind['limiar']:.2f}"
-                   + (f" · modelo gravado na base: {ind['modelo_base']}" if ind.get("modelo_base") else ""))

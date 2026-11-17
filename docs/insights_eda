@@ -1,0 +1,125 @@
+{
+  "respostas": {
+    "1": {
+      "tema": "Tamanho do mercado",
+      "texto": "O mercado analisado soma 95.138 pedidos entregues, R$ 13.049.522 em receita e 2.914 vendedores ativos em 73 categorias. As 10 maiores categorias respondem por 63,2% da receita (líder: health_beauty, 9,4%) e as 3 maiores UFs (SP, RJ, MG) por 66,5% dos pedidos."
+    },
+    "2": {
+      "tema": "Oferta × demanda por UF",
+      "texto": "SP tem 42,0% da demanda e 70,7% da oferta. UFs com muita demanda e poucos vendedores locais: BA (179 pedidos por vendedor local), PE (175 pedidos por vendedor local), CE (106 pedidos por vendedor local). 5 UFs não têm nenhum vendedor com entregas na base."
+    },
+    "3": {
+      "tema": "Saturação por categoria",
+      "texto": "Mais saturadas (poucos pedidos por vendedor): construction_tools_construction (6,0), small_appliances (6,3), home_construction (7,2). Mais oportunas (muitos pedidos por vendedor): watches_gifts (57,8), bed_bath_table (49,1), office_furniture (41,8)."
+    },
+    "4": {
+      "tema": "Peso do frete no preço",
+      "texto": "O frete pesa mais quanto mais barato o item: a mediana é 73,2% do preço até R$ 25, 37,7% entre R$ 25 e 50 e 3,8% acima de R$ 500; 36,6% de todos os itens têm frete igual ou maior que 30% do preço. O frete acompanha o peso (correlação 0,61), o preço (0,41) e a distância (0,39)."
+    },
+    "5": {
+      "tema": "Prazo prometido × entregue",
+      "texto": "8,11% dos pedidos entregues chegam depois do prazo. A entrega leva em média 12,6 dias (mediana 10,2; 90% até 23,1) contra 23,7 prometidos, folga média de 11,2 dias. Quando atrasa, o atraso médio é de 9,6 dias. O atraso é um evento raro e de impacto grande."
+    },
+    "6": {
+      "tema": "Onde e quando o atraso se concentra",
+      "texto": "As maiores taxas (UFs com 200+ pedidos) estão em AL (23,9%), MA (19,9%), PI (16,0%). Em volume, concentram os atrasos SP (30,4% dos atrasos com 42,0% dos pedidos), RJ (21,3% dos atrasos com 12,8% dos pedidos), MG (8,2% dos atrasos com 11,8% dos pedidos). Rotas mais críticas (1.000+ itens): SP → CE (14,9%, 20,8 dias), SP → RJ (14,9%, 16,1 dias), SP → BA (14,8%, 19,8 dias). Dentro do mesmo estado a entrega leva 7,9 dias e atrasa 6,0%; entre estados, 15,0 dias e 9,0%. Meses de maior atraso: 2018-03 (21,4%), 2018-02 (16,0%), 2017-11 (14,3%) (demais meses: 5,0% em média)."
+    },
+    "7": {
+      "tema": "Sinais de atraso antes da postagem",
+      "texto": "Existe sinal, mas moderado (só 7,9% dos itens atrasam). Do 1º ao 5º quintil: distância 6,5% → 10,8%, frete 5,9% → 9,6%, peso 7,4% → 8,7% e prazo estimado 8,6% → 5,1% (quanto maior a folga prometida, menor o atraso). Rota, UF de origem e calendário completam o conjunto de variáveis do modelo."
+    },
+    "8": {
+      "tema": "Atraso e reputação",
+      "texto": "Pedidos atrasados recebem nota média 2,57 contra 4,29 no prazo, e 54,1% deles são notas 1–2 (no prazo: 9,2%). A nota cai com a espera: 4,42 até 7 dias contra 2,25 acima de 30 dias (63,0% de notas 1–2). Correlação da nota com o tempo de entrega: -0,33; com os dias de atraso: -0,27."
+    },
+    "9": {
+      "tema": "Concentração do atraso entre vendedores",
+      "texto": "A base é pequena e desigual: 2.914 vendedores com entregas, mediana de 7 pedidos; só 1.217 (42%) têm 10+ e os 10% maiores concentram 67,0% da receita. Entre os que têm 10+ pedidos, a taxa de atraso mediana é 6,4% e 25% passam de 11,0%; os 161 vendedores com taxa de 15% ou mais (13,2% do grupo) respondem por 17,5% dos itens atrasados. A taxa de atraso do vendedor tem correlação -0,37 com a nota média dele e 0,28 com o tempo de postagem."
+    },
+    "10": {
+      "tema": "Benchmark dos melhores lojistas",
+      "texto": "Há massa crítica para benchmark (5+ vendedores com 10+ pedidos) em 32 categorias, que cobrem 95% dos vendedores elegíveis. Os 208 melhores lojistas não se destacam em velocidade logística: taxa de atraso mediana de 5,9% contra 6,7%, postagem de 2,6 contra 2,5 dias e entrega de 12,0 contra 11,7 dias; a diferença está no frete mais leve no preço (15,4% contra 23,5%)."
+    }
+  },
+  "kpis": {
+    "pedidos_entregues": 95138.0,
+    "itens_entregues": 108652.0,
+    "receita_rs": 13049522.0,
+    "vendedores_ativos": 2914.0,
+    "categorias": 73.0,
+    "top10_categorias_pct_receita": 63.2472,
+    "top3_uf_pct_pedidos": 66.5496,
+    "sp_pct_demanda": 41.9979,
+    "sp_pct_oferta": 70.7469,
+    "ufs_sem_vendedor": 5.0,
+    "frete_pct_mediano_ate25": 73.2,
+    "frete_pct_mediano_acima500": 3.8,
+    "pct_itens_frete_ge30": 36.5691,
+    "pct_itens_ate25_frete_ge30": 97.4,
+    "corr_frete_peso": 0.6127,
+    "corr_frete_distancia": 0.3918,
+    "corr_frete_preco": 0.4133,
+    "taxa_atraso_pct": 8.11,
+    "entrega_media_dias": 12.56,
+    "prazo_prometido_medio": 23.74,
+    "folga_media_dias": 11.18,
+    "atraso_medio_quando_atrasa": 9.55,
+    "atraso_uf_max": 23.92,
+    "atraso_uf_min": 2.94,
+    "atraso_mesmo_estado": 5.96,
+    "atraso_entre_estados": 8.98,
+    "entrega_mesmo_estado": 7.92,
+    "entrega_entre_estados": 15.04,
+    "taxa_item_atrasado_pct": 7.8876,
+    "nota_atrasados": 2.57,
+    "nota_no_prazo": 4.29,
+    "pct_notas12_atrasados": 54.07,
+    "pct_notas12_no_prazo": 9.22,
+    "nota_gt30": 2.25,
+    "pct_notas12_gt30": 63.0,
+    "nota_ate7": 4.42,
+    "corr_nota_tempo": -0.334,
+    "vendedores_total": 2914.0,
+    "vendedores_ge10": 1217.0,
+    "mediana_pedidos_vendedor": 7.0,
+    "top10_vendedores_pct_receita": 67.0209,
+    "atraso_mediano_vendedor": 6.4103,
+    "pct_vendedores_atraso_ge15": 13.2293,
+    "share_atrasos_vendedores_ge15": 17.4837,
+    "corr_atraso_nota_vendedor": -0.3661,
+    "categorias_massa_critica_5": 32.0,
+    "categorias_massa_critica_10": 23.0,
+    "cobertura_massa_critica_pct": 94.8233,
+    "melhores_lojistas": 208.0,
+    "frete_pct_melhores": 15.4135,
+    "frete_pct_demais": 23.5467,
+    "atraso_melhores_pct": 5.9293,
+    "atraso_demais_pct": 6.6667
+  },
+  "graficos": {
+    "grafico1_demanda_oferta": {
+      "arquivo": "grafico1_demanda_oferta.png",
+      "titulo": "SP concentra 42% da demanda e 71% da oferta",
+      "subtitulo": "A oferta é mais concentrada que a demanda: RJ, RS, BA, DF têm demanda pelo menos 2 vezes maior que a oferta local e dependem de vendedores de outros estados",
+      "modulo": "Radar de Oportunidades"
+    },
+    "grafico2_frete_preco": {
+      "arquivo": "grafico2_frete_preco.png",
+      "titulo": "Em itens de até R$ 25, o frete equivale a 73% do preço",
+      "subtitulo": "Mediana de frete ÷ preço por faixa de preço. 37% de todos os itens têm frete de 30% ou mais do preço: o frete decide a margem de quem vende barato",
+      "modulo": "Diagnóstico 360° · margem"
+    },
+    "grafico3_atraso_por_uf": {
+      "arquivo": "grafico3_atraso_por_uf.png",
+      "titulo": "O risco de atraso vai de 2,9% a 23,9% conforme o destino",
+      "subtitulo": "% de pedidos atrasados por UF do comprador (UFs com 200+ pedidos). Em laranja, destinos acima da média geral: o Termômetro de Envio precisa considerar a rota",
+      "modulo": "Termômetro de Envio"
+    },
+    "grafico4_nota_tempo_entrega": {
+      "arquivo": "grafico4_nota_tempo_entrega.png",
+      "titulo": "Esperar mais de 30 dias derruba a nota média para 2,25",
+      "subtitulo": "Pedidos atrasados recebem nota média 2,57, contra 4,29 dos entregues no prazo: a logística é reputação",
+      "modulo": "Diagnóstico 360° · reputação"
+    }
+  }
+}

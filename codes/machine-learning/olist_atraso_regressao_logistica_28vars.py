@@ -1031,3 +1031,88 @@ PATH_PREDICTIONS = "/Volumes/workspace/olist_gold/ml_predictions/predictions"
 )
 
 print("Previsões salvas no Volume com sucesso!")
+
+# COMMAND ----------
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 10. Calibração: gráfico de confiabilidade
+# MAGIC Agrupa os pedidos em 10 faixas de probabilidade prevista (mesmo número de pedidos em cada uma) e compara,
+# MAGIC em cada faixa, a **probabilidade média prevista** com a **taxa real de atraso**. Modelo perfeitamente calibrado
+# MAGIC = pontos sobre a diagonal. Abaixo da diagonal o modelo superestima o risco; acima, subestima.
+# MAGIC
+# MAGIC Três períodos: validação (os 3 folds, previsões fora da amostra), calibração (mar/2018) e teste (abr–ago/2018).
+
+# COMMAND ----------
+
+import matplotlib.pyplot as plt
+from sklearn.calibration import calibration_curve
+
+# Previsões fora da amostra na validação: cada fold treinado só com o seu passado (igual à seção 6)
+y_val, p_val = [], []
+for f in folds:
+    Xf, yf = Xy(f["tr"])
+    m_f = ModeloAtraso(construir_pipeline().fit(Xf, yf), Xf, yf)   # com a mesma correção de prevalência do modelo final
+    y_val.append(f["va"]["atrasou"].to_numpy())
+    p_val.append(m_f.prever(f["va"]))
+
+periodos = {
+    "Validação (3 folds)": (np.concatenate(y_val), np.concatenate(p_val)),
+    "Calibração (mar/2018)": (calib["atrasou"].to_numpy(), modelo.prever(calib)),
+    "Teste (abr–ago/2018)": (teste["atrasou"].to_numpy(), modelo.prever(teste)),
+}
+
+
+def resumo_calibracao(y, p, n_bins=10):
+    """Média prevista x real, Brier, ECE (erro médio de calibração) e intercepto/inclinação de calibração."""
+    real, prev = calibration_curve(y, p, n_bins=n_bins, strategy="quantile")
+    pesos = np.histogram(p, bins=np.quantile(p, np.linspace(0, 1, n_bins + 1)))[0]
+    pesos = pesos[: len(real)] / pesos[: len(real)].sum()
+    z = logit(np.clip(p, 1e-7, 1 - 1e-7)).reshape(-1, 1)
+    rl = LogisticRegression(penalty=None, max_iter=1000).fit(z, y)
+    return real, prev, {
+        "pedidos": len(y), "prob_media_prevista": p.mean(), "taxa_real": y.mean(),
+        "brier": brier_score_loss(y, p), "brier_taxa_base": brier_score_loss(y, np.full(len(y), y.mean())),
+        "ece": float(np.sum(pesos * np.abs(real - prev))),
+        "inclinacao_calibracao": float(rl.coef_[0][0]),   # 1 = ideal; < 1 = previsões extremas demais
+    }
+
+
+curvas_cal, linhas_cal = {}, []
+for nome, (y, p) in periodos.items():
+    real, prev, r = resumo_calibracao(y, p)
+    curvas_cal[nome] = (prev, real)
+    linhas_cal.append({"periodo": nome, **r})
+tab_cal = pd.DataFrame(linhas_cal).set_index("periodo")
+display(tab_cal.round(4).reset_index())
+
+# Gráfico: curva de confiabilidade + distribuição das probabilidades
+cores = {"Validação (3 folds)": "#7F7F7F", "Calibração (mar/2018)": "#D9822B", "Teste (abr–ago/2018)": "#3B6FA8"}
+lim = max(max(np.max(prev), np.max(real)) for prev, real in curvas_cal.values()) * 1.1
+
+fig, (ax, axh) = plt.subplots(2, 1, figsize=(8, 9), gridspec_kw={"height_ratios": [3, 1]}, sharex=True)
+ax.plot([0, lim], [0, lim], ls="--", color="gray", lw=1, label="Calibração perfeita")
+for nome, (prev, real) in curvas_cal.items():
+    ax.plot(prev, real, marker="o", lw=2, ms=6, color=cores[nome],
+            label=f"{nome}: previsto {tab_cal.loc[nome, 'prob_media_prevista']:.1%} × real {tab_cal.loc[nome, 'taxa_real']:.1%}")
+ax.axvline(LIMIAR_ALERTA, color="#3B6FA8", ls=":", lw=1)
+ax.text(LIMIAR_ALERTA, lim * 0.97, " limiar de alerta", color="#3B6FA8", fontsize=8, va="top")
+ax.set_xlim(0, lim)
+ax.set_ylim(0, lim)
+ax.set_ylabel("Taxa real de atraso na faixa")
+ax.set_title("Gráfico de confiabilidade: Regressão Logística (10 faixas com o mesmo nº de pedidos)")
+ax.legend(fontsize=8, loc="upper left")
+ax.grid(alpha=0.3)
+
+for nome, (y, p) in periodos.items():
+    axh.hist(p, bins=np.linspace(0, lim, 40), histtype="step", lw=1.5, color=cores[nome], density=True, label=nome)
+axh.set_xlabel("Probabilidade de atraso prevista")
+axh.set_ylabel("Densidade")
+axh.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+t = tab_cal.loc["Teste (abr–ago/2018)"]
+print(f"Teste: média prevista {t['prob_media_prevista']:.2%} × real {t['taxa_real']:.2%} | Brier {t['brier']:.4f} "
+      f"(taxa base {t['brier_taxa_base']:.4f}) | ECE {t['ece']:.4f} | inclinação {t['inclinacao_calibracao']:.2f}")

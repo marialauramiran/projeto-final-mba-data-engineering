@@ -1,42 +1,56 @@
-# Raio-X do Vendedor · App Streamlit
+# Raio-X do Vendedor · App Streamlit (Databricks Apps)
 
-Camada de consumo da arquitetura medalhão: lê as tabelas Gold exportadas do Databricks
-(Parquet) ou consulta via Amazon Athena, e mostra o semáforo de viabilidade com 4 sinais
-(Mercado, Preço e frete, Risco de atraso, Reputação) e recomendações.
+Lê as tabelas Gold em Parquet de `/Volumes/workspace/olist_gold/parquet` e as predições de
+`/Volumes/workspace/olist_gold/ml_predictions`.
 
-## Rodar localmente
-```bash
-pip install -r requirements.txt
-python gerar_dados_demo.py        # dados SINTÉTICOS para testar (opcional)
-streamlit run streamlit_app.py
+| Card | Tabela(s) | Grão |
+|---|---|---|
+| Mercado | gold_agg_mercado + gold_ref_rotas (estados compradores) | mês × categoria |
+| Preço e frete | gold_agg_frete | categoria × UF de origem |
+| Risco de atraso | gold_ref_rotas | categoria × UF origem × UF destino |
+| Reputação | gold_agg_reputacao | categoria |
+| Categoria | gold_agg_categoria | mês × categoria |
+| Predições do cenário | ml_predictions/predictions | pedido |
+
+## Estrutura
+```
+streamlit_app.py      tela (formulário, cards, semáforo, recomendações)
+predicoes.py          card Predições do cenário (base predictions / Model Serving)
+src/config.py         caminhos, mapeamento de colunas, limites do semáforo, nomes de categoria
+src/dados.py          leitura do Volume e padronização das colunas
+src/regras.py         cálculo dos cards e do semáforo
+src/formatacao.py     nome amigável da categoria (só exibição)
+app.yaml              comando e variáveis do Databricks Apps
 ```
 
-## Usar os dados reais
-1. No Databricks, rode `databricks/06_export_gold_app.py` (depois dos notebooks Bronze/Silver/Gold).
-2. Copie `agg_mercado.parquet` e `ref_rotas.parquet` para `data/`.
-3. (Opcional) Copie `modelo.joblib` + `config.json` do MLflow para `model/`.
-   `config.json` precisa ter `{"features": [...]}` com a ordem das colunas do modelo.
-   Sem modelo, o risco usa a taxa histórica da rota (referência sem ML).
+## Nome das categorias
+A tela mostra `agro_industria_e_comercio` como **Agro Industria e Comercio**. O valor interno não muda,
+então os filtros continuam batendo com a Gold e com as predições. Para acentos e siglas, preencha
+`CORRECOES_NOME` em `src/config.py` (troca palavra por palavra).
 
-## Usar o Athena
-`RAIOX_FONTE=athena streamlit run streamlit_app.py` + `.streamlit/secrets.toml`
-(veja `secrets.toml.example`).
-
-## Contrato de schema
-| Tabela | Colunas |
-|---|---|
-| agg_mercado | categoria, uf_destino, pedidos, meses, pedidos_jan_ago_2017, pedidos_jan_ago_2018, vendedores_ativos, nota_media, pct_notas_1_2, nota_se_atrasar, preco_p25, preco_p50, preco_p75, parcelas_moda, queixa_top |
-| ref_rotas | uf_origem, uf_destino, distancia_km, pedidos, taxa_atraso_hist, frete_base, frete_por_kg |
-
-## Regras do semáforo (`src/config.py`)
+## Regras do semáforo (src/config.py)
 | Sinal | Amarelo | Vermelho |
 |---|---|---|
-| Frete / ticket | ≥ 20% | ≥ 30% |
-| Atraso (pior região) | ≥ 8% | ≥ 12% |
-| Nota da categoria | < 4,0 | < 3,5 |
-| Pedidos/mês | < 100 | < 20 |
+| Mercado: participação da categoria nos pedidos | < 1% (ou crescimento anual negativo) | < 0,3% |
+| Frete ÷ (preço + frete) | ≥ 20% | ≥ 30% |
+| Atraso da pior região de destino | ≥ 8% | ≥ 12% |
+| Nota média da categoria | < 4,0 | < 3,5 |
 
-Pontos: verde 0, amarelo 1, vermelho 2. Geral: 0–1 verde, 2–4 amarelo, ≥ 5 vermelho.
+Pontos: verde 0, amarelo 1, vermelho 2. Geral: 0–1 verde, 2–4 amarelo, ≥ 5 vermelho
+(qualquer card vermelho deixa o geral no mínimo amarelo). Categoria e Predições não pontuam.
 
-## Deploy
-Streamlit Community Cloud apontando para este repositório (arquivo principal `streamlit_app.py`).
+## Definições
+- Janela: jan/2017 a ago/2018. Crescimento: pedidos jan–ago/2018 ÷ jan–ago/2017 − 1.
+- Colunas `*_pct` da Gold (0–100) são convertidas para 0–1 no app.
+- Vendedores ativos: média mensal (a Gold conta vendedores distintos por mês).
+- Risco de atraso: pedidos_atrasados ÷ total_pedidos, filtrado pela categoria; com menos de 30 pedidos
+  entregues, usa todas as categorias da UF de origem.
+- Preço mín. do formulário é o preço de referência nos cards Preço e frete e Categoria.
+
+## Diagnóstico
+Barra lateral → "Mostrar colunas das tabelas": mostra colunas reais e campos não encontrados.
+
+## Permissões (uma vez, no SQL Editor)
+GRANT USE CATALOG ON CATALOG workspace TO `<service-principal-do-app>`;
+GRANT USE SCHEMA ON SCHEMA workspace.olist_gold TO `<service-principal-do-app>`;
+GRANT READ VOLUME ON SCHEMA workspace.olist_gold TO `<service-principal-do-app>`;

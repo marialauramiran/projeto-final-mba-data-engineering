@@ -1,11 +1,7 @@
-"""Leitura das tabelas Gold em Parquet a partir do Volume do Unity Catalog.
+"""Leitura das tabelas Gold (Parquet) do Volume e ajuste dos nomes de colunas ao app.
 
-- No Databricks Apps: usa o databricks-sdk (Files API) com o service principal do app.
-- Em cluster/notebook ou teste local: se o caminho existir no disco, lê direto com pandas.
-
-Aceita os dois formatos que o Spark costuma gerar:
-  <BASE>/gold_agg_mercado/part-0000*.parquet   (pasta)
-  <BASE>/gold_agg_mercado.parquet              (arquivo único)
+- Databricks Apps: Files API do databricks-sdk, com o service principal do app.
+- Cluster ou teste local: lê direto do disco quando o caminho existe.
 """
 import io
 import os
@@ -20,29 +16,27 @@ class TabelaNaoEncontrada(Exception):
     pass
 
 
-# ---------- leitura local (disco) ----------
-def _ler_local(base: str, tabela: str) -> pd.DataFrame:
+# ---------------- leitura ----------------
+def _ler_local(base, tabela):
     for alvo in (os.path.join(base, tabela), os.path.join(base, f"{tabela}.parquet")):
         if os.path.isdir(alvo):
             arqs = sorted(os.path.join(r, f) for r, _, fs in os.walk(alvo) for f in fs
                           if not f.startswith(("_", ".")) and f.endswith((".parquet", ".csv")))
-            if not arqs:
-                break
-            return pd.concat([pd.read_csv(a) if a.endswith(".csv") else pd.read_parquet(a) for a in arqs],
-                             ignore_index=True)
-        if os.path.isfile(alvo):
+            if arqs:
+                return pd.concat([pd.read_csv(a) if a.endswith(".csv") else pd.read_parquet(a) for a in arqs],
+                                 ignore_index=True)
+        elif os.path.isfile(alvo):
             return pd.read_parquet(alvo)
     raise TabelaNaoEncontrada(f"{tabela} não encontrada em {base}")
 
 
-# ---------- leitura pelo SDK (Databricks Apps) ----------
 @st.cache_resource
 def _cliente():
     from databricks.sdk import WorkspaceClient
     return WorkspaceClient()
 
 
-def _listar_parquet(w, pasta: str) -> list[str]:
+def _listar_parquet(w, pasta):
     arqs = []
     for e in w.files.list_directory_contents(pasta):
         nome = e.name.rstrip("/")
@@ -55,7 +49,7 @@ def _listar_parquet(w, pasta: str) -> list[str]:
     return arqs
 
 
-def _ler_sdk(base: str, tabela: str) -> pd.DataFrame:
+def _ler_sdk(base, tabela):
     w = _cliente()
     entradas = {e.name.rstrip("/"): e for e in w.files.list_directory_contents(base)}
     for nome in (tabela, f"{tabela}.parquet"):
@@ -64,50 +58,55 @@ def _ler_sdk(base: str, tabela: str) -> pd.DataFrame:
             continue
         arqs = _listar_parquet(w, e.path) if e.is_directory else [e.path]
         if arqs:
-            partes = [pd.read_parquet(io.BytesIO(w.files.download(a).contents.read())) for a in arqs]
-            return pd.concat(partes, ignore_index=True)
+            return pd.concat([pd.read_parquet(io.BytesIO(w.files.download(a).contents.read())) for a in arqs],
+                             ignore_index=True)
     raise TabelaNaoEncontrada(f"{tabela} não encontrada em {base}")
 
 
 @st.cache_data(ttl=3600, show_spinner="Carregando dados da camada Gold...")
-def ler_bruto(tabela: str) -> pd.DataFrame:
+def ler_bruto(tabela):
     base = C.BASE_PATH.rstrip("/")
-    if os.path.isdir(base):
-        return _ler_local(base, tabela)
-    return _ler_sdk(base, tabela)
+    return _ler_local(base, tabela) if os.path.isdir(base) else _ler_sdk(base, tabela)
 
 
-def carregar(tabela: str, obrigatoria: bool = True) -> pd.DataFrame | None:
-    """Lê a tabela e renomeia as colunas reais para os nomes usados pelo app."""
-    try:
-        df = ler_bruto(tabela)
-    except TabelaNaoEncontrada:
-        if obrigatoria:
-            raise
-        return None
-    mapa = {real: logico for logico, real in C.COLUNAS.get(tabela, {}).items() if real in df.columns}
-    df = df.rename(columns=mapa)
+# ---------------- padronização ----------------
+def mapear_colunas(tabela, colunas):
+    """{nome_real: nome_do_app}, sem diferenciar maiúsculas."""
+    reais = {str(c).lower(): c for c in colunas}
+    return {reais[r.lower()]: l for l, r in C.COLUNAS.get(tabela, {}).items() if r.lower() in reais}
+
+
+def padronizar(tabela, df):
+    df = df.rename(columns=mapear_colunas(tabela, df.columns)).copy()
     for col in ("categoria", "uf_origem", "uf_destino"):
         if col in df.columns:
-            df[col] = df[col].astype(str).str.strip()
+            s = df[col].where(df[col].notna()).astype("string").str.strip()
+            df[col] = s.where(~s.str.lower().isin(C.CATEGORIAS_IGNORADAS)) if col == "categoria" else s
+    if "mes" in df.columns:
+        df["mes"] = pd.to_datetime(df["mes"], errors="coerce")
+    for col in df.columns:
+        if col not in ("categoria", "uf_origem", "uf_destino", "mes", "reclamacao_top"):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    for col in C.PERCENTUAIS & set(df.columns):
+        df[col] = df[col] / 100
     return df
 
 
-def diagnostico() -> list[dict]:
-    """Para o expander de diagnóstico: o que foi encontrado em cada tabela."""
+def carregar(tabela):
+    return padronizar(tabela, ler_bruto(tabela))
+
+
+def diagnostico():
     linhas = []
     for tabela, mapa in C.COLUNAS.items():
         try:
             df = ler_bruto(tabela)
-            faltando = [
-                    f"{coluna_origem} → {coluna_destino}"
-                    for coluna_origem, coluna_destino in mapa.items()
-                    if coluna_destino not in df.columns
-            ]
-            linhas.append({"tabela": tabela, "status": "OK", "linhas": len(df),
-                           "colunas na tabela": ", ".join(map(str, df.columns)),
-                           "mapeadas e não encontradas": ", ".join(faltando) or "—"})
+            achadas = set(mapear_colunas(tabela, df.columns).values())
+            faltando = [f"{l} → {r}" for l, r in mapa.items() if l not in achadas]
+            linhas.append({"tabela": tabela, "status": "OK" if not faltando else "colunas faltando",
+                           "linhas": len(df), "faltando": ", ".join(faltando) or "—",
+                           "colunas": ", ".join(map(str, df.columns))})
         except Exception as e:  # noqa: BLE001
             linhas.append({"tabela": tabela, "status": "não encontrada", "linhas": 0,
-                           "colunas na tabela": "—", "mapeadas e não encontradas": str(e)[:150]})
+                           "faltando": str(e)[:160], "colunas": "—"})
     return linhas
